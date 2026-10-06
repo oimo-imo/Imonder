@@ -24,12 +24,16 @@ class ViewGizmo extends StatelessWidget {
     required this.angles,
     required this.onAxis,
     required this.onReset,
+    required this.onOrbit,
     this.size = 112,
   });
 
   final ValueListenable<(double, double)> angles;
   final ValueChanged<int> onAxis;
   final VoidCallback onReset;
+
+  /// Dragging the gizmo rotates the view (radians).
+  final void Function(double dx, double dy) onOrbit;
   final double size;
 
   /// Projects the six axis ends for the given camera yaw / pitch (Z-up).
@@ -67,6 +71,7 @@ class ViewGizmo extends StatelessWidget {
             label: '視点ギズモ',
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
+              onPanUpdate: (d) => onOrbit(d.delta.dx * 0.012, d.delta.dy * 0.012),
               onTapUp: (d) {
                 final p = d.localPosition - Offset(size / 2, size / 2);
                 GizmoBubble? best;

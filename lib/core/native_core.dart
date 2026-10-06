@@ -10,6 +10,10 @@ typedef _Vec2 = void Function(Pointer<Void>, double, double);
 typedef _Vec1 = void Function(Pointer<Void>, double);
 typedef _Int1 = void Function(Pointer<Void>, int);
 typedef _Angles = void Function(Pointer<Void>, Pointer<Float>);
+typedef _Flag = void Function(Pointer<Void>, int);
+typedef _Tap = int Function(Pointer<Void>, double, double, int);
+typedef _Pt = int Function(Pointer<Void>, double, double);
+typedef _Query = int Function(Pointer<Void>);
 typedef _Render = int Function(Pointer<Void>, int, int, double, Pointer<Uint8>);
 
 DynamicLibrary _open() {
@@ -30,6 +34,16 @@ class NativeCore {
     _snap = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Int1>('imonder_snap_view');
     _snapAxis = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Int1>('imonder_snap_axis');
     _angles = l.lookupFunction<Void Function(Pointer<Void>, Pointer<Float>), _Angles>('imonder_get_angles');
+    _setEditMode = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_edit_mode');
+    _setSelectMode = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_select_mode');
+    _setMoveTool = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_move_tool');
+    _tap = l.lookupFunction<Int32 Function(Pointer<Void>, Float, Float, Int32), _Tap>('imonder_tap');
+    _dragBegin = l.lookupFunction<Int32 Function(Pointer<Void>, Float, Float), _Pt>('imonder_drag_begin');
+    _dragUpdate = l.lookupFunction<Void Function(Pointer<Void>, Float, Float), _Vec2>('imonder_drag_update');
+    _dragEnd = l.lookupFunction<Void Function(Pointer<Void>), _Destroy>('imonder_drag_end');
+    _undo = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_undo');
+    _redo = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_redo');
+    _status = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_status');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -44,6 +58,16 @@ class NativeCore {
   late final _Int1 _snap;
   late final _Int1 _snapAxis;
   late final _Angles _angles;
+  late final _Flag _setEditMode;
+  late final _Flag _setSelectMode;
+  late final _Flag _setMoveTool;
+  late final _Tap _tap;
+  late final _Pt _dragBegin;
+  late final _Vec2 _dragUpdate;
+  late final _Destroy _dragEnd;
+  late final _Query _undo;
+  late final _Query _redo;
+  late final _Query _status;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -75,6 +99,28 @@ class NativeCore {
       malloc.free(p);
     }
   }
+
+  void setEditMode(bool on) => _setEditMode(_handle, on ? 1 : 0);
+
+  /// 0 vertex, 1 edge, 2 face.
+  void setSelectMode(int mode) => _setSelectMode(_handle, mode);
+
+  /// Show the move handles on the selection.
+  void setMoveTool(bool on) => _setMoveTool(_handle, on ? 1 : 0);
+
+  /// Tap-select; `nx`/`ny` are fractions of the viewport. True if an element was hit.
+  bool tap(double nx, double ny, {bool add = false}) => _tap(_handle, nx, ny, add ? 1 : 0) == 1;
+
+  /// True if a move handle was grabbed.
+  bool dragBegin(double nx, double ny) => _dragBegin(_handle, nx, ny) == 1;
+  void dragUpdate(double dnx, double dny) => _dragUpdate(_handle, dnx, dny);
+  void dragEnd() => _dragEnd(_handle);
+
+  bool undo() => _undo(_handle) == 1;
+  bool redo() => _redo(_handle) == 1;
+
+  /// Bit 0: can undo, bit 1: can redo, bit 2: has selection.
+  int status() => _status(_handle);
 
   /// Renders an RGBA8 frame. The returned bytes are a fresh copy.
   Uint8List? render(int w, int h, double scale) {

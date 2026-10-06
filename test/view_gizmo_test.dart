@@ -22,7 +22,7 @@ void main() {
     var reset = false;
     await t.pumpWidget(MaterialApp(
       home: Center(
-        child: ViewGizmo(angles: angles, onAxis: (a) => axis = a, onReset: () => reset = true),
+        child: ViewGizmo(angles: angles, onAxis: (a) => axis = a, onReset: () => reset = true, onOrbit: (_, _) {}),
       ),
     ));
     final centre = t.getCenter(find.byType(ViewGizmo));

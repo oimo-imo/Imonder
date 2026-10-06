@@ -21,4 +21,21 @@ void main() {
     expect(core.render(0, 10, 1.0), isNull);
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
+
+  test('edit mode: tap selects, handle drag moves, undo restores', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.snapView(3);
+    core.snapAxis(3); // front
+    core.setEditMode(true);
+    core.setSelectMode(2);
+    core.setMoveTool(true);
+    core.render(400, 300, 1.0); // records the aspect ratio
+    expect(core.status() & 4, 0);
+    expect(core.tap(0.5, 0.5), isTrue);
+    expect(core.status() & 4, 4);
+    expect(core.tap(0.01, 0.01), isFalse);
+    expect(core.status() & 4, 0);
+    expect(core.undo(), isFalse);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
 }

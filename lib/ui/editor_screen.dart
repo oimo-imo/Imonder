@@ -18,7 +18,7 @@ class EditorScreen extends StatefulWidget {
 
 class _EditorScreenState extends State<EditorScreen> {
   final _viewport = ModelViewportController();
-  int _tool = 0;
+  int _tool = 0; // 0 = move (the only tool wired up so far)
   int _selectMode = 2; // 0 vertex, 1 edge, 2 face
   bool _editMode = false;
   ReleaseInfo? _pendingUpdate;
@@ -36,6 +36,7 @@ class _EditorScreenState extends State<EditorScreen> {
   @override
   void initState() {
     super.initState();
+    _viewport.setMoveTool(true);
     _backgroundUpdateCheck();
   }
 
@@ -74,6 +75,7 @@ class _EditorScreenState extends State<EditorScreen> {
             angles: _viewport.angles,
             onAxis: _viewport.snapAxis,
             onReset: () => _viewport.snapView(3),
+            onOrbit: _viewport.orbit,
           ),
         ),
         Positioned(left: 12, right: 12, bottom: MediaQuery.paddingOf(context).bottom + 20, child: _toolBar(accent)),
@@ -120,11 +122,19 @@ class _EditorScreenState extends State<EditorScreen> {
         _iconBtn(Icons.system_update_alt, 'アップデート', _openSettings,
             color: _pendingUpdate != null ? accent : _muted, dot: _pendingUpdate != null),
         const Spacer(),
-        _iconBtn(Icons.hub_outlined, _editMode ? '編集モード' : 'オブジェクトモード', () => setState(() => _editMode = !_editMode),
+        _iconBtn(Icons.hub_outlined, _editMode ? '編集モード' : 'オブジェクトモード', () {
+          setState(() => _editMode = !_editMode);
+          _viewport.setEditMode(_editMode);
+        },
             color: _editMode ? accent : _muted),
         Container(width: 1, height: 20, color: const Color(0xFF333338), margin: const EdgeInsets.symmetric(horizontal: 4)),
         for (var i = 0; i < 3; i++)
-          _iconBtn(selIcons[i], selLabels[i], _editMode ? () => setState(() => _selectMode = i) : null,
+          _iconBtn(selIcons[i], selLabels[i], _editMode
+              ? () {
+                  setState(() => _selectMode = i);
+                  _viewport.setSelectMode(i);
+                }
+              : null,
               color: !_editMode ? const Color(0xFF4A4A50) : (_selectMode == i ? const Color(0xFFE6E6E9) : _muted)),
       ]),
     );
@@ -145,7 +155,10 @@ class _EditorScreenState extends State<EditorScreen> {
                   tooltip: _tools[i].$2,
                   padding: EdgeInsets.zero,
                   style: i == _tool ? IconButton.styleFrom(backgroundColor: accent, foregroundColor: const Color(0xFF1A1A1C)) : null,
-                  onPressed: () => setState(() => _tool = i),
+                  onPressed: () {
+                    setState(() => _tool = i);
+                    _viewport.setMoveTool(i == 0);
+                  },
                   icon: Icon(_tools[i].$1, size: 20, color: i == _tool ? const Color(0xFF1A1A1C) : const Color(0xFFA9A9B0)),
                 ),
               ),
@@ -157,10 +170,16 @@ class _EditorScreenState extends State<EditorScreen> {
         width: 52,
         height: 52,
         decoration: const BoxDecoration(color: _panel, shape: BoxShape.circle),
-        child: IconButton(
-          tooltip: '元に戻す',
-          onPressed: null,
-          icon: const Icon(Icons.undo, size: 19, color: Color(0xFF5E5E65)),
+        child: ValueListenableBuilder<int>(
+          valueListenable: _viewport.status,
+          builder: (context, status, _) {
+            final can = status & 1 != 0;
+            return IconButton(
+              tooltip: '元に戻す',
+              onPressed: can ? _viewport.undo : null,
+              icon: Icon(Icons.undo, size: 19, color: can ? const Color(0xFFE6E6E9) : const Color(0xFF5E5E65)),
+            );
+          },
         ),
       ),
     ]);
