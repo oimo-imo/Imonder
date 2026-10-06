@@ -1,0 +1,143 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.1). Empty = just build, no release.'
+        required: false
+        type: string
+
+env:
+  FLUTTER_VERSION: '3.47.6'
+
+jobs:
+  # ---------------------------------------------------------------- checks --
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: rust }
+      - name: Rust tests
+        run: cargo test --release --manifest-path rust/Cargo.toml
+      - name: Build core for Dart FFI test
+        run: cargo build --release --manifest-path rust/Cargo.toml
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+  # ------------------------------------------------------------- version ---
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.v.outputs.name }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - id: v
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"; echo "release=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            echo "name=${{ inputs.version }}" >> "$GITHUB_OUTPUT"; echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=0.0.0" >> "$GITHUB_OUTPUT"; echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------------------------------------------- android --
+  android:
+    needs: [test, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-linux-android }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: rust }
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build Rust core (arm64)
+        working-directory: rust
+        run: cargo ndk -t arm64-v8a -o ../android/app/src/main/jniLibs build --release
+      - name: Signing key (optional secrets, otherwise the committed dev key)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$KEYSTORE_B64" ]]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/release.jks
+            printf 'storeFile=release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > android/key.properties
+          else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 not set - signing with the committed dev key"
+          fi
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Build APK
+        run: >
+          flutter build apk --release --target-platform android-arm64
+          --build-name=${{ needs.version.outputs.name }} --build-number=${{ github.run_number }}
+      - name: Name the artifact
+        run: cp build/app/outputs/flutter-apk/app-release.apk imonder-android-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with: { name: android, path: imonder-android-arm64.apk }
+
+  # --------------------------------------------------------------- windows --
+  windows:
+    needs: [test, version]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: rust }
+      - name: Build Rust core
+        run: cargo build --release --manifest-path rust/Cargo.toml
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Build Windows app
+        run: flutter build windows --release --build-name=${{ needs.version.outputs.name }} --build-number=${{ github.run_number }}
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath imonder-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: imonder-windows-x64.zip }
+
+  # --------------------------------------------------------------- release --
+  release:
+    needs: [android, windows, version]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          name: Imonder ${{ needs.version.outputs.name }}
+          generate_release_notes: true
+          files: |
+            dist/imonder-android-arm64.apk
+            dist/imonder-windows-x64.zip

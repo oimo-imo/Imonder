@@ -1,0 +1,165 @@
+import 'dart:async';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../core/native_core.dart';
+
+/// Longest side (in physical pixels) of the software-rendered frame.
+/// Larger screens are rendered smaller and scaled up.
+const _maxRenderSide = 1100;
+
+class ModelViewportController {
+  _ViewportState? _state;
+  void snapView(int preset) => _state?._snap(preset);
+}
+
+/// 3D viewport: draws frames from the Rust core and maps fingers / mouse to the camera.
+///
+/// Touch: 1 finger orbit, 2 fingers pan + pinch zoom.
+/// Mouse: left/middle drag orbit, Shift+drag or right drag pan, wheel zoom.
+class ModelViewport extends StatefulWidget {
+  const ModelViewport({super.key, this.controller});
+  final ModelViewportController? controller;
+
+  @override
+  State<ModelViewport> createState() => _ViewportState();
+}
+
+class _ViewportState extends State<ModelViewport> {
+  late final NativeCore _core = NativeCore();
+  final Map<int, Offset> _pointers = {};
+  ui.Image? _image;
+  Size _size = Size.zero;
+  double _dpr = 1;
+  bool _rendering = false;
+  bool _dirty = true;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller?._state = this;
+  }
+
+  @override
+  void dispose() {
+    widget.controller?._state = null;
+    _image?.dispose();
+    _core.dispose();
+    super.dispose();
+  }
+
+  void _snap(int preset) {
+    _core.snapView(preset);
+    _requestFrame();
+  }
+
+  void _requestFrame() {
+    _dirty = true;
+    if (_rendering || _size.isEmpty) return;
+    scheduleMicrotask(_renderFrame);
+  }
+
+  Future<void> _renderFrame() async {
+    if (_rendering || !_dirty || !mounted) return;
+    _rendering = true;
+    _dirty = false;
+    final k = math.min(1.0, _maxRenderSide / (math.max(_size.width, _size.height) * _dpr));
+    final w = math.max(1, (_size.width * _dpr * k).round());
+    final h = math.max(1, (_size.height * _dpr * k).round());
+    final pixels = _core.render(w, h, _dpr * k);
+    if (pixels != null) {
+      final c = Completer<ui.Image>();
+      ui.decodeImageFromPixels(pixels, w, h, ui.PixelFormat.rgba8888, c.complete);
+      final img = await c.future;
+      if (!mounted) {
+        img.dispose();
+        return;
+      }
+      final old = _image;
+      setState(() => _image = img);
+      old?.dispose();
+    }
+    _rendering = false;
+    if (_dirty) _requestFrame();
+  }
+
+  // ---------------------------------------------------------------- input --
+
+  void _down(PointerDownEvent e) => _pointers[e.pointer] = e.localPosition;
+
+  void _up(PointerEvent e) => _pointers.remove(e.pointer);
+
+  void _move(PointerMoveEvent e) {
+    final prev = _pointers[e.pointer];
+    if (prev == null) return;
+    final h = math.max(_size.height, 1.0);
+
+    if (e.kind == PointerDeviceKind.mouse) {
+      final d = e.localPosition - prev;
+      final shift = HardwareKeyboard.instance.isShiftPressed;
+      final pan = (e.buttons & kSecondaryMouseButton) != 0 || shift;
+      if (pan) {
+        _core.pan(d.dx / h, d.dy / h);
+      } else {
+        _core.orbit(d.dx * 0.008, d.dy * 0.008);
+      }
+    } else if (_pointers.length == 1) {
+      final d = e.localPosition - prev;
+      _core.orbit(d.dx * 0.008, d.dy * 0.008);
+    } else if (_pointers.length == 2) {
+      final before = _pointers.values.toList();
+      _pointers[e.pointer] = e.localPosition;
+      final after = _pointers.values.toList();
+      final c0 = (before[0] + before[1]) / 2, c1 = (after[0] + after[1]) / 2;
+      final d0 = (before[0] - before[1]).distance, d1 = (after[0] - after[1]).distance;
+      final dc = c1 - c0;
+      _core.pan(dc.dx / h, dc.dy / h);
+      if (d0 > 8 && d1 > 8) _core.zoom(d1 / d0);
+    }
+    _pointers[e.pointer] = e.localPosition;
+    _requestFrame();
+  }
+
+  void _signal(PointerSignalEvent e) {
+    if (e is PointerScrollEvent) {
+      _core.zoom(math.exp(-e.scrollDelta.dy * 0.0015));
+      _requestFrame();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _dpr = MediaQuery.devicePixelRatioOf(context);
+    return LayoutBuilder(builder: (context, c) {
+      final size = Size(c.maxWidth, c.maxHeight);
+      if (size != _size) {
+        _size = size;
+        WidgetsBinding.instance.addPostFrameCallback((_) => _requestFrame());
+      }
+      return Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: _down,
+        onPointerMove: _move,
+        onPointerUp: _up,
+        onPointerCancel: _up,
+        onPointerSignal: _signal,
+        child: ColoredBox(
+          color: const Color(0xFF1E1E21),
+          child: _image == null
+              ? const SizedBox.expand()
+              : RawImage(
+                  image: _image,
+                  fit: BoxFit.fill,
+                  filterQuality: FilterQuality.medium,
+                  width: size.width,
+                  height: size.height,
+                ),
+        ),
+      );
+    });
+  }
+}
