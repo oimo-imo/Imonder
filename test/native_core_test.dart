@@ -1,5 +1,6 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:imonder/core/native_core.dart';
@@ -58,5 +59,44 @@ void main() {
     expect(core.opRange(), isNull);
     core.setTool(3);
     core.dispose();
+  }, skip: exists ? false : 'rust library not built');
+
+  test('objects: add, list, hide, save and load', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    expect(core.objects().map((o) => o.name), ['立方体']);
+    expect(core.addObject(4), isTrue);
+    expect(core.addObject(99), isFalse);
+    var list = core.objects();
+    expect(list.map((o) => o.name), ['立方体', '球']);
+    expect(list.last.active, isTrue);
+    expect(core.setVisible(0, false), isTrue);
+    expect(core.objects().first.visible, isFalse);
+    expect(core.selectObject(0), isTrue);
+    expect(core.selectObject(7), isFalse);
+
+    final rev = core.revision();
+    final bytes = core.save();
+    expect(bytes.sublist(0, 4), [0x49, 0x4d, 0x4e, 0x44]); // "IMND"
+
+    final other = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    expect(other.load(bytes), isTrue);
+    list = other.objects();
+    expect(list.map((o) => o.name), ['立方体', '球']);
+    expect(list.first.visible, isFalse);
+    expect(other.load(Uint8List.fromList([1, 2, 3])), isFalse);
+    expect(other.objects().length, 2, reason: 'a bad file changes nothing');
+    other.newWork();
+    expect(other.objects().map((o) => o.name), ['立方体']);
+
+    expect(core.revision(), rev);
+    expect(core.duplicateObject(), isTrue);
+    expect(core.revision(), greaterThan(rev));
+    expect(core.deleteObject(), isTrue);
+
+    final thumb = core.thumbnail(64, 64)!;
+    expect(thumb.length, 64 * 64 * 4);
+    expect(core.thumbnail(0, 64), isNull);
+    core.dispose();
+    other.dispose();
   }, skip: exists ? false : 'rust library not built');
 }

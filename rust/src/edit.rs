@@ -152,7 +152,8 @@ pub fn pick_edge(mesh: &Mesh, view: &View, p: (f32, f32), radius: f32) -> Option
         .map(|(e, _)| e)
 }
 
-pub fn pick_face(mesh: &Mesh, view: &View, p: (f32, f32)) -> Option<usize> {
+/// Front-most face under `p` and its depth.
+pub fn pick_face(mesh: &Mesh, view: &View, p: (f32, f32)) -> Option<(usize, f32)> {
     let mut best: Option<(usize, f32)> = None;
     for (fi, f) in mesh.faces.iter().enumerate() {
         if !face_front_facing(mesh, fi, view.eye) {
@@ -168,7 +169,7 @@ pub fn pick_face(mesh: &Mesh, view: &View, p: (f32, f32)) -> Option<usize> {
             }
         }
     }
-    best.map(|(fi, _)| fi)
+    best
 }
 
 /// Depth at `p` if it lies inside the triangle (screen space).
@@ -185,7 +186,7 @@ fn tri_depth(p: (f32, f32), a: (f32, f32, f32), b: (f32, f32, f32), c: (f32, f32
 
 #[derive(Clone)]
 pub struct Snapshot {
-    pub mesh: Mesh,
+    pub scene: crate::scene::Scene,
     pub sel: Selection,
 }
 

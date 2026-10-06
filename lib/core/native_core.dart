@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
@@ -18,9 +19,27 @@ typedef _Op = int Function(Pointer<Void>, int);
 typedef _OpAdjust = int Function(Pointer<Void>, double);
 typedef _OpRange = int Function(Pointer<Void>, Pointer<Float>);
 typedef _Void = void Function(Pointer<Void>);
+typedef _Bytes = Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>);
+typedef _FreeBytes = void Function(Pointer<Uint8>, int);
+typedef _Load = int Function(Pointer<Void>, Pointer<Uint8>, int);
+typedef _SetVisible = int Function(Pointer<Void>, int, int);
+typedef _Revision = int Function(Pointer<Void>);
+typedef _Thumb = int Function(Pointer<Void>, int, int, Pointer<Uint8>);
+
+/// One entry of the scene list.
+class SceneObject {
+  const SceneObject(this.name, this.visible, this.active);
+  final String name;
+  final bool visible;
+  final bool active;
+}
 typedef _Render = int Function(Pointer<Void>, int, int, double, Pointer<Uint8>);
 
+/// Tests point this at the freshly built library instead of the platform default.
+String? debugLibraryPath;
+
 DynamicLibrary _open() {
+  if (debugLibraryPath != null) return DynamicLibrary.open(debugLibraryPath!);
   if (Platform.isAndroid) return DynamicLibrary.open('libimonder_core.so');
   if (Platform.isWindows) return DynamicLibrary.open('imonder_core.dll');
   if (Platform.isMacOS) return DynamicLibrary.open('libimonder_core.dylib');
@@ -53,6 +72,18 @@ class NativeCore {
     _undo = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_undo');
     _redo = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_redo');
     _status = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_status');
+    _addObject = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_add_object');
+    _duplicateObject = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_duplicate_object');
+    _deleteObject = l.lookupFunction<Int32 Function(Pointer<Void>), _Query>('imonder_delete_object');
+    _selectObject = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_select_object');
+    _setVisible = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32), _SetVisible>('imonder_set_visible');
+    _sceneJson = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_scene_json');
+    _save = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_save');
+    _freeBytes = l.lookupFunction<Void Function(Pointer<Uint8>, Uint32), _FreeBytes>('imonder_free_bytes');
+    _load = l.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint8>, Uint32), _Load>('imonder_load');
+    _newWork = l.lookupFunction<Void Function(Pointer<Void>), _Void>('imonder_new_work');
+    _revision = l.lookupFunction<Uint64 Function(Pointer<Void>), _Revision>('imonder_revision');
+    _thumb = l.lookupFunction<Int32 Function(Pointer<Void>, Uint32, Uint32, Pointer<Uint8>), _Thumb>('imonder_render_thumbnail');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -82,6 +113,18 @@ class NativeCore {
   late final _Query _undo;
   late final _Query _redo;
   late final _Query _status;
+  late final _Op _addObject;
+  late final _Query _duplicateObject;
+  late final _Query _deleteObject;
+  late final _Op _selectObject;
+  late final _SetVisible _setVisible;
+  late final _Bytes _sceneJson;
+  late final _Bytes _save;
+  late final _FreeBytes _freeBytes;
+  late final _Load _load;
+  late final _Void _newWork;
+  late final _Revision _revision;
+  late final _Thumb _thumb;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -157,6 +200,71 @@ class NativeCore {
 
   /// Bit 0 can undo, 1 can redo, 2 has selection, 3 adjustable operation active, 4-5 select mode.
   int status() => _status(_handle);
+
+  // ------------------------------------------------------------------ objects --
+
+  /// 0 cube, 1 plane, 2 cylinder, 3 cone, 4 sphere, 5 torus.
+  bool addObject(int kind) => _addObject(_handle, kind) == 1;
+  bool duplicateObject() => _duplicateObject(_handle) == 1;
+  bool deleteObject() => _deleteObject(_handle) == 1;
+  bool selectObject(int index) => _selectObject(_handle, index) == 1;
+  bool setVisible(int index, bool visible) => _setVisible(_handle, index, visible ? 1 : 0) == 1;
+
+  Uint8List _takeBytes(Pointer<Uint8> p, Pointer<Uint32> len) {
+    final n = len.value;
+    final out = Uint8List.fromList(p.asTypedList(n));
+    _freeBytes(p, n);
+    return out;
+  }
+
+  List<SceneObject> objects() {
+    final len = malloc<Uint32>();
+    try {
+      final bytes = _takeBytes(_sceneJson(_handle, len), len);
+      final list = jsonDecode(utf8.decode(bytes)) as List<dynamic>;
+      return [for (final o in list) SceneObject(o['name'] as String, o['visible'] as bool, o['active'] as bool)];
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  // --------------------------------------------------------------------- files --
+
+  /// The work in the `.imnd` format.
+  Uint8List save() {
+    final len = malloc<Uint32>();
+    try {
+      return _takeBytes(_save(_handle, len), len);
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  /// Replaces the work; false (and nothing changes) if the data is not a valid work.
+  bool load(Uint8List data) {
+    final p = malloc<Uint8>(data.isEmpty ? 1 : data.length);
+    try {
+      p.asTypedList(data.length).setAll(0, data);
+      return _load(_handle, p, data.length) == 1;
+    } finally {
+      malloc.free(p);
+    }
+  }
+
+  void newWork() => _newWork(_handle);
+
+  /// Changes whenever the work changes (not for camera moves).
+  int revision() => _revision(_handle);
+
+  /// RGBA thumbnail of the whole work from a fixed viewpoint.
+  Uint8List? thumbnail(int w, int h) {
+    final p = malloc<Uint8>(w * h * 4);
+    try {
+      return _thumb(_handle, w, h, p) == 1 ? Uint8List.fromList(p.asTypedList(w * h * 4)) : null;
+    } finally {
+      malloc.free(p);
+    }
+  }
 
   /// Renders an RGBA8 frame. The returned bytes are a fresh copy.
   Uint8List? render(int w, int h, double scale) {

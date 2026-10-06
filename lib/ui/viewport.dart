@@ -8,9 +8,10 @@ import 'package:flutter/services.dart';
 
 import '../core/native_core.dart';
 
-/// Longest side (in physical pixels) of the software-rendered frame.
-/// Larger screens are rendered smaller and scaled up.
-const _maxRenderSide = 1100;
+/// Longest side (in physical pixels) the software renderer draws at full quality. The real size
+/// adapts to how long frames take (see `_adapt`), so slower devices still stay smooth.
+const _maxRenderSide = 2600;
+const _minQuality = 0.35;
 
 class ModelViewportController {
   _ViewportState? _state;
@@ -76,6 +77,59 @@ class ModelViewportController {
   void adjustOp(double value) {
     _state?._core.opAdjust(value);
     _state?._changed();
+  }
+
+  // ---------------------------------------------------------------- objects --
+
+  List<SceneObject> objects() => _state?._core.objects() ?? const [];
+
+  /// 0 cube, 1 plane, 2 cylinder, 3 cone, 4 sphere, 5 torus.
+  void addObject(int kind) => _run((c) => c.addObject(kind));
+  void duplicateObject() => _run((c) => c.duplicateObject());
+  void deleteObject() => _run((c) => c.deleteObject());
+  void selectObject(int index) => _run((c) => c.selectObject(index));
+  void setObjectVisible(int index, bool visible) => _run((c) => c.setVisible(index, visible));
+
+  void _run(void Function(NativeCore) f) {
+    final s = _state;
+    if (s == null) return;
+    f(s._core);
+    s._changed();
+  }
+
+  // ------------------------------------------------------------------- files --
+
+  /// Changes whenever the work changes (not for camera moves).
+  int get revision => _state?._core.revision() ?? 0;
+
+  Uint8List? saveBytes() => _state?._core.save();
+
+  bool loadBytes(Uint8List data) {
+    final s = _state;
+    if (s == null) return false;
+    final ok = s._core.load(data);
+    s._core.setEditMode(false);
+    _editMode = false;
+    s._changed();
+    return ok;
+  }
+
+  void newWork() {
+    _state?._core.newWork();
+    _editMode = false;
+    _state?._changed();
+  }
+
+  /// PNG thumbnail of the whole work, for the gallery.
+  Future<Uint8List?> thumbnailPng({int size = 320}) async {
+    final rgba = _state?._core.thumbnail(size, size);
+    if (rgba == null) return null;
+    final done = Completer<ui.Image>();
+    ui.decodeImageFromPixels(rgba, size, size, ui.PixelFormat.rgba8888, done.complete);
+    final img = await done.future;
+    final data = await img.toByteData(format: ui.ImageByteFormat.png);
+    img.dispose();
+    return data?.buffer.asUint8List();
   }
 
   void undo() {
@@ -152,6 +206,21 @@ class _ViewportState extends State<ModelViewport> {
     _requestFrame();
   }
 
+  double _quality = 0.75; // starts a little below the maximum; it grows while frames are fast
+  double _avgMs = 8;
+
+  /// Keeps frames under ~20 ms: shrink the render size when slow, grow it back when there is headroom.
+  void _adapt(double ms) {
+    _avgMs = _avgMs * 0.8 + ms * 0.2;
+    if (_avgMs > 20 && _quality > _minQuality) {
+      _quality = math.max(_minQuality, _quality * 0.85);
+      _avgMs = 14;
+    } else if (_avgMs < 8 && _quality < 1.0) {
+      _quality = math.min(1.0, _quality * 1.1);
+      _avgMs = 12;
+    }
+  }
+
   void _requestFrame() {
     widget.controller?.angles.value = _core.angles();
     _dirty = true;
@@ -163,10 +232,12 @@ class _ViewportState extends State<ModelViewport> {
     if (_rendering || !_dirty || !mounted) return;
     _rendering = true;
     _dirty = false;
-    final k = math.min(1.0, _maxRenderSide / (math.max(_size.width, _size.height) * _dpr));
+    final k = math.min(1.0, _maxRenderSide * _quality / (math.max(_size.width, _size.height) * _dpr));
     final w = math.max(1, (_size.width * _dpr * k).round());
     final h = math.max(1, (_size.height * _dpr * k).round());
+    final clock = Stopwatch()..start();
     final pixels = _core.render(w, h, _dpr * k);
+    _adapt(clock.elapsedMicroseconds / 1000);
     if (pixels != null) {
       final c = Completer<ui.Image>();
       ui.decodeImageFromPixels(pixels, w, h, ui.PixelFormat.rgba8888, c.complete);
