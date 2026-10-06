@@ -14,7 +14,12 @@ const _maxRenderSide = 1100;
 
 class ModelViewportController {
   _ViewportState? _state;
+
+  /// Camera (yaw, pitch) in radians; the view gizmo listens to this.
+  final ValueNotifier<(double, double)> angles = ValueNotifier((-0.7, 0.5));
+
   void snapView(int preset) => _state?._snap(preset);
+  void snapAxis(int axis) => _state?._snapAxis(axis);
 }
 
 /// 3D viewport: draws frames from the Rust core and maps fingers / mouse to the camera.
@@ -57,7 +62,13 @@ class _ViewportState extends State<ModelViewport> {
     _requestFrame();
   }
 
+  void _snapAxis(int axis) {
+    _core.snapAxis(axis);
+    _requestFrame();
+  }
+
   void _requestFrame() {
+    widget.controller?.angles.value = _core.angles();
     _dirty = true;
     if (_rendering || _size.isEmpty) return;
     scheduleMicrotask(_renderFrame);

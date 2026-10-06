@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../update/update_sheet.dart';
 import '../update/updater.dart';
+import 'view_gizmo.dart';
 import 'viewport.dart';
 
 const _panel = Color(0xFF2A2A2E);
@@ -66,7 +67,15 @@ class _EditorScreenState extends State<EditorScreen> {
       body: Stack(children: [
         Positioned.fill(child: ModelViewport(controller: _viewport)),
         Positioned(top: 0, left: 0, right: 0, child: _topBar(accent)),
-        Positioned(right: 10, top: MediaQuery.paddingOf(context).top + 62, child: _viewButtons()),
+        Positioned(
+          right: 6,
+          top: MediaQuery.paddingOf(context).top + 58,
+          child: ViewGizmo(
+            angles: _viewport.angles,
+            onAxis: _viewport.snapAxis,
+            onReset: () => _viewport.snapView(3),
+          ),
+        ),
         Positioned(left: 12, right: 12, bottom: MediaQuery.paddingOf(context).bottom + 20, child: _toolBar(accent)),
       ]),
     );
@@ -119,26 +128,6 @@ class _EditorScreenState extends State<EditorScreen> {
               color: !_editMode ? const Color(0xFF4A4A50) : (_selectMode == i ? const Color(0xFFE6E6E9) : _muted)),
       ]),
     );
-  }
-
-  Widget _viewButtons() {
-    Widget b(String t, int preset) => Padding(
-          padding: const EdgeInsets.only(bottom: 6),
-          child: SizedBox(
-            width: 44,
-            height: 44,
-            child: Material(
-              color: _panel,
-              borderRadius: BorderRadius.circular(14),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(14),
-                onTap: () => _viewport.snapView(preset),
-                child: Center(child: Text(t, style: const TextStyle(fontSize: 13, color: Color(0xFFD4D4D9)))),
-              ),
-            ),
-          ),
-        );
-    return Column(children: [b('前', 0), b('右', 1), b('上', 2), b('視', 3)]);
   }
 
   Widget _toolBar(Color accent) {

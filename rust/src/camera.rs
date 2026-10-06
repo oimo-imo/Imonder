@@ -68,6 +68,23 @@ impl Camera {
         M4::perspective(fovy, aspect, 0.05, 500.0)
     }
 
+    /// Look at the target from along a world axis.
+    /// 0 +X (right), 1 -X (left), 2 +Y (back), 3 -Y (front), 4 +Z (top), 5 -Z (bottom).
+    pub fn snap_axis(&mut self, axis: i32) {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        let (yaw, pitch) = match axis {
+            0 => (0.0, 0.0),
+            1 => (PI, 0.0),
+            2 => (FRAC_PI_2, 0.0),
+            3 => (-FRAC_PI_2, 0.0),
+            4 => (-FRAC_PI_2, MAX_PITCH),
+            5 => (-FRAC_PI_2, -MAX_PITCH),
+            _ => return,
+        };
+        self.yaw = yaw;
+        self.pitch = pitch;
+    }
+
     /// Snap to a preset view (Blender numpad style): 0 front, 1 right, 2 top, 3 perspective.
     pub fn snap(&mut self, preset: i32) {
         match preset {

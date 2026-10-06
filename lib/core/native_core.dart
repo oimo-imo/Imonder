@@ -9,6 +9,7 @@ typedef _Destroy = void Function(Pointer<Void>);
 typedef _Vec2 = void Function(Pointer<Void>, double, double);
 typedef _Vec1 = void Function(Pointer<Void>, double);
 typedef _Int1 = void Function(Pointer<Void>, int);
+typedef _Angles = void Function(Pointer<Void>, Pointer<Float>);
 typedef _Render = int Function(Pointer<Void>, int, int, double, Pointer<Uint8>);
 
 DynamicLibrary _open() {
@@ -27,6 +28,8 @@ class NativeCore {
     _pan = l.lookupFunction<Void Function(Pointer<Void>, Float, Float), _Vec2>('imonder_pan');
     _zoom = l.lookupFunction<Void Function(Pointer<Void>, Float), _Vec1>('imonder_zoom');
     _snap = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Int1>('imonder_snap_view');
+    _snapAxis = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Int1>('imonder_snap_axis');
+    _angles = l.lookupFunction<Void Function(Pointer<Void>, Pointer<Float>), _Angles>('imonder_get_angles');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -39,6 +42,8 @@ class NativeCore {
   late final _Vec2 _pan;
   late final _Vec1 _zoom;
   late final _Int1 _snap;
+  late final _Int1 _snapAxis;
+  late final _Angles _angles;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -56,6 +61,20 @@ class NativeCore {
 
   /// 0 front, 1 right, 2 top, 3 perspective.
   void snapView(int preset) => _snap(_handle, preset);
+
+  /// Looks along a world axis: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z.
+  void snapAxis(int axis) => _snapAxis(_handle, axis);
+
+  /// Camera (yaw, pitch) in radians.
+  (double, double) angles() {
+    final p = malloc<Float>(2);
+    try {
+      _angles(_handle, p);
+      return (p[0], p[1]);
+    } finally {
+      malloc.free(p);
+    }
+  }
 
   /// Renders an RGBA8 frame. The returned bytes are a fresh copy.
   Uint8List? render(int w, int h, double scale) {
