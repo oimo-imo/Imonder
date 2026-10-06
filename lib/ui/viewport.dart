@@ -18,18 +18,23 @@ class ModelViewportController {
   /// Camera (yaw, pitch) in radians; the view gizmo listens to this.
   final ValueNotifier<(double, double)> angles = ValueNotifier((-0.7, 0.5));
 
-  /// Core status bits: 1 can undo, 2 can redo, 4 has selection.
-  final ValueNotifier<int> status = ValueNotifier(0);
+  /// Core status bits: 1 can undo, 2 can redo, 4 has selection, 8 adjustable operation active,
+  /// bits 4-5 select mode (0 vertex, 1 edge, 2 face).
+  final ValueNotifier<int> status = ValueNotifier(2 << 4);
+
+  /// (min, max, current, isInteger) of the operation that can still be adjusted.
+  final ValueNotifier<(double, double, double, bool)?> opRange = ValueNotifier(null);
 
   bool _editMode = false;
   int _selectMode = 2;
-  bool _moveTool = false;
+  int _tool = 0;
 
   void _attach(_ViewportState s) {
     _state = s;
     s._core.setEditMode(_editMode);
     s._core.setSelectMode(_selectMode);
-    s._core.setMoveTool(_moveTool);
+    s._core.setTool(_tool);
+    s._changed();
   }
 
   void snapView(int preset) => _state?._snap(preset);
@@ -48,9 +53,28 @@ class ModelViewportController {
     _state?._changed();
   }
 
-  void setMoveTool(bool on) {
-    _moveTool = on;
-    _state?._core.setMoveTool(on);
+  /// 0 move, 1 rotate, 2 scale, 3 loop cut.
+  void setTool(int tool) {
+    _tool = tool;
+    _state?._core.setTool(tool);
+    _state?._changed();
+  }
+
+  void selectAll() {
+    _state?._core.selectAll();
+    _state?._changed();
+  }
+
+  /// Runs an operation (0 extrude, 1 inset, 2 loop cut, 3 bevel, 4 merge, 5 delete).
+  /// False if it does not apply to the current selection.
+  bool runOp(int kind) {
+    final ok = _state?._core.opBegin(kind) ?? false;
+    _state?._changed();
+    return ok;
+  }
+
+  void adjustOp(double value) {
+    _state?._core.opAdjust(value);
     _state?._changed();
   }
 
@@ -109,7 +133,12 @@ class _ViewportState extends State<ModelViewport> {
 
   /// Something other than the camera changed (selection, mesh, mode).
   void _changed() {
-    widget.controller?.status.value = _core.status();
+    final c = widget.controller;
+    if (c != null) {
+      final st = _core.status();
+      c.status.value = st;
+      c.opRange.value = st & 8 != 0 ? _core.opRange() : null;
+    }
     _requestFrame();
   }
 

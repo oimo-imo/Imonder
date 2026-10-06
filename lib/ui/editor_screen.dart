@@ -18,25 +18,31 @@ class EditorScreen extends StatefulWidget {
 
 class _EditorScreenState extends State<EditorScreen> {
   final _viewport = ModelViewportController();
-  int _tool = 0; // 0 = move (the only tool wired up so far)
+  int _tool = 0; // 0 move, 1 rotate, 2 scale, 3 loop cut
   int _selectMode = 2; // 0 vertex, 1 edge, 2 face
   bool _editMode = false;
   ReleaseInfo? _pendingUpdate;
 
-  static const _tools = <(IconData, String)>[
-    (Icons.open_with, '移動'),
-    (Icons.rotate_right, '回転'),
-    (Icons.zoom_out_map, '拡大縮小'),
-    (Icons.publish, '押し出し'),
-    (Icons.crop_square, 'インセット'),
-    (Icons.splitscreen, 'ループカット'),
-    (Icons.change_history, 'ベベル'),
+  /// Toolbar entries. `tool` >= 0 selects a tool with handles / tap behaviour,
+  /// `op` >= 0 runs an operation on the selection right away, `all` selects everything.
+  static const _tools = <_ToolDef>[
+    _ToolDef(Icons.open_with, '移動', tool: 0),
+    _ToolDef(Icons.rotate_right, '回転', tool: 1),
+    _ToolDef(Icons.zoom_out_map, '拡大縮小', tool: 2),
+    _ToolDef(Icons.publish, '押し出し', op: 0, need: '面か辺を選んでください'),
+    _ToolDef(Icons.crop_square, 'インセット', op: 1, need: '面を選んでください'),
+    _ToolDef(Icons.splitscreen, 'ループカット', tool: 3),
+    _ToolDef(Icons.change_history, 'ベベル', op: 3, need: '辺を選んでください'),
+    _ToolDef(Icons.call_merge, '結合', op: 4, need: '2つ以上の頂点・辺・面を選んでください'),
+    _ToolDef(Icons.delete_outline, '削除', op: 5, need: '先に選択してください'),
+    _ToolDef(Icons.select_all, '全選択', all: true),
   ];
 
   @override
   void initState() {
     super.initState();
-    _viewport.setMoveTool(true);
+    _viewport.setTool(0);
+    _viewport.status.addListener(_syncSelectMode);
     _backgroundUpdateCheck();
   }
 
@@ -60,6 +66,45 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
+  /// The core can change the select mode itself (e.g. merge leaves a vertex selected).
+  void _syncSelectMode() {
+    final mode = (_viewport.status.value >> 4) & 3;
+    if (mode == _selectMode) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() => _selectMode = mode);
+    });
+  }
+
+  void _enterEditMode() {
+    if (_editMode) return;
+    setState(() => _editMode = true);
+    _viewport.setEditMode(true);
+  }
+
+  void _useTool(_ToolDef t) {
+    _enterEditMode();
+    if (t.all) {
+      _viewport.selectAll();
+    } else if (t.tool >= 0) {
+      setState(() => _tool = t.tool);
+      _viewport.setTool(t.tool);
+      if (t.tool == 3) {
+        setState(() => _selectMode = 1);
+        _viewport.setSelectMode(1);
+      }
+    } else if (!_viewport.runOp(t.op)) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(t.need), duration: const Duration(seconds: 2)));
+    }
+  }
+
+  @override
+  void dispose() {
+    _viewport.status.removeListener(_syncSelectMode);
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
@@ -76,6 +121,21 @@ class _EditorScreenState extends State<EditorScreen> {
             onAxis: _viewport.snapAxis,
             onReset: () => _viewport.snapView(3),
             onOrbit: _viewport.orbit,
+          ),
+        ),
+        if (_editMode && _tool == 3)
+          Positioned(
+            top: MediaQuery.paddingOf(context).top + 62,
+            left: 16,
+            child: const Text('辺をタップして分割', style: TextStyle(color: _muted, fontSize: 13)),
+          ),
+        Positioned(
+          left: 12,
+          right: 12,
+          bottom: MediaQuery.paddingOf(context).bottom + 84,
+          child: ValueListenableBuilder<(double, double, double, bool)?>(
+            valueListenable: _viewport.opRange,
+            builder: (context, r, _) => r == null ? const SizedBox.shrink() : _adjustCapsule(accent, r),
           ),
         ),
         Positioned(left: 12, right: 12, bottom: MediaQuery.paddingOf(context).bottom + 20, child: _toolBar(accent)),
@@ -140,29 +200,71 @@ class _EditorScreenState extends State<EditorScreen> {
     );
   }
 
+  /// "Adjust last operation" capsule: icon, slider, value.
+  Widget _adjustCapsule(Color accent, (double, double, double, bool) r) {
+    final (lo, hi, cur, isInt) = r;
+    return Container(
+      height: 56,
+      padding: const EdgeInsets.fromLTRB(6, 0, 16, 0),
+      decoration: BoxDecoration(color: _panel, borderRadius: BorderRadius.circular(28)),
+      child: Row(children: [
+        Container(
+          width: 44,
+          height: 44,
+          decoration: const BoxDecoration(color: Color(0xFF34343A), shape: BoxShape.circle),
+          child: Icon(Icons.tune, size: 19, color: accent),
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(activeTrackColor: accent, thumbColor: const Color(0xFFE6E6E9)),
+            child: Slider(
+              value: cur.clamp(lo, hi),
+              min: lo,
+              max: hi,
+              divisions: isInt ? (hi - lo).round() : null,
+              onChanged: _viewport.adjustOp,
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 44,
+          child: Text(
+            isInt ? cur.round().toString() : cur.toStringAsFixed(2),
+            textAlign: TextAlign.right,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 15, fontWeight: FontWeight.w500),
+          ),
+        ),
+      ]),
+    );
+  }
+
   Widget _toolBar(Color accent) {
     return Row(children: [
       Expanded(
         child: Container(
           padding: const EdgeInsets.all(4),
           decoration: BoxDecoration(color: _panel, borderRadius: BorderRadius.circular(26)),
-          child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-            for (var i = 0; i < _tools.length; i++)
-              SizedBox(
-                width: 40,
-                height: 44,
-                child: IconButton(
-                  tooltip: _tools[i].$2,
-                  padding: EdgeInsets.zero,
-                  style: i == _tool ? IconButton.styleFrom(backgroundColor: accent, foregroundColor: const Color(0xFF1A1A1C)) : null,
-                  onPressed: () {
-                    setState(() => _tool = i);
-                    _viewport.setMoveTool(i == 0);
-                  },
-                  icon: Icon(_tools[i].$1, size: 20, color: i == _tool ? const Color(0xFF1A1A1C) : const Color(0xFFA9A9B0)),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(children: [
+              for (final t in _tools)
+                SizedBox(
+                  width: 44,
+                  height: 44,
+                  child: IconButton(
+                    tooltip: t.label,
+                    padding: EdgeInsets.zero,
+                    style: _editMode && t.tool >= 0 && t.tool == _tool
+                        ? IconButton.styleFrom(backgroundColor: accent, foregroundColor: const Color(0xFF1A1A1C))
+                        : null,
+                    onPressed: () => _useTool(t),
+                    icon: Icon(t.icon,
+                        size: 20,
+                        color: _editMode && t.tool >= 0 && t.tool == _tool ? const Color(0xFF1A1A1C) : const Color(0xFFA9A9B0)),
+                  ),
                 ),
-              ),
-          ]),
+            ]),
+          ),
         ),
       ),
       const SizedBox(width: 8),
@@ -184,4 +286,14 @@ class _EditorScreenState extends State<EditorScreen> {
       ),
     ]);
   }
+}
+
+class _ToolDef {
+  const _ToolDef(this.icon, this.label, {this.tool = -1, this.op = -1, this.all = false, this.need = ''});
+  final IconData icon;
+  final String label;
+  final int tool;
+  final int op;
+  final bool all;
+  final String need;
 }
