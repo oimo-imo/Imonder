@@ -4,7 +4,7 @@
 use crate::camera::Camera;
 use crate::edit::{edge_faces, face_front_facing, Selection, SelectMode};
 use crate::math::{v3, M4, V3};
-use crate::mesh::Mesh;
+use crate::scene::Object;
 
 const BG: [f32; 3] = [30.0, 30.0, 33.0]; // #1E1E21
 
@@ -169,13 +169,15 @@ pub enum HandleStyle {
 
 pub struct EditOverlay<'a> {
     pub sel: &'a Selection,
-    /// Transform handles: centre, world length and style, if they should be drawn.
-    pub handles: Option<(V3, f32, HandleStyle)>,
 }
 
 pub struct Scene<'a> {
-    pub mesh: &'a Mesh,
+    pub objects: &'a [Object],
+    pub active: usize,
+    /// Edit mode: selection highlight and vertex dots on the active object.
     pub edit: Option<EditOverlay<'a>>,
+    /// Transform handles: centre, world length and style, if they should be drawn.
+    pub handles: Option<(V3, f32, HandleStyle)>,
 }
 
 const ACCENT: [f32; 3] = [242.0, 163.0, 94.0]; // #F2A35E
@@ -209,8 +211,13 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
     f.line(clip(&vp, v3(0.0, -big, 0.0)), clip(&vp, v3(0.0, big, 0.0)), [123.0, 200.0, 108.0], 0.55, 1.5 * scale, 0.0);
 
     // Faces: back-face cull, soft headlight + hemisphere shading (clay look).
-    let mesh = scene.mesh;
     let light = eye.sub(cam.target).norm();
+    for (oi, obj) in scene.objects.iter().enumerate() {
+    if !obj.visible {
+        continue;
+    }
+    let mesh = &obj.mesh;
+    let is_active = oi == scene.active;
     for (fi, face) in mesh.faces.iter().enumerate() {
         if face.len() < 3 {
             continue;
@@ -228,7 +235,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
         let k = 0.30 + 0.45 * head + 0.25 * sky;
         let base = [148.0, 148.0, 155.0]; // #94949B
         let mut col = [base[0] * k * 1.15, base[1] * k * 1.15, base[2] * k * 1.15].map(|c: f32| c.min(255.0));
-        if let Some(e) = &scene.edit {
+        if let (Some(e), true) = (&scene.edit, is_active) {
             if e.sel.mode == SelectMode::Face && e.sel.faces.contains(&fi) {
                 for c in 0..3 {
                     col[c] = col[c] * 0.45 + ACCENT[c] * k.min(1.0) * 0.55;
@@ -257,42 +264,46 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
         for k in 0..face.len() {
             let a = clip(&vp, mesh.verts[face[k] as usize]);
             let b = clip(&vp, mesh.verts[face[(k + 1) % face.len()] as usize]);
-            f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, 0.0005);
+            if is_active && scene.edit.is_none() {
+                f.line(a, b, ACCENT, 1.0, 2.2 * scale, 0.0008);
+            } else {
+                f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, 0.0005);
+            }
         }
     }
+    }
 
-    if let Some(e) = &scene.edit {
-        draw_edit_overlay(&mut f, scene, e, &vp, eye, scale);
-        if let Some((centre, len, style)) = e.handles {
-            let c0 = clip(&vp, centre);
-            match style {
-                HandleStyle::Rotate => {
-                    for (axis, col) in AXIS_COL.iter().enumerate() {
-                        let mut prev = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, 0));
-                        for i in 1..=crate::edit::RING_SEGMENTS {
-                            let cur = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, i));
-                            f.line(prev, cur, *col, 0.9, 2.6 * scale, 4.0);
-                            prev = cur;
-                        }
+    if let (Some(e), Some(obj)) = (&scene.edit, scene.objects.get(scene.active)) {
+        draw_edit_overlay(&mut f, &obj.mesh, e, &vp, eye, scale);
+    }
+    if let Some((centre, len, style)) = scene.handles {
+        let c0 = clip(&vp, centre);
+        match style {
+            HandleStyle::Rotate => {
+                for (axis, col) in AXIS_COL.iter().enumerate() {
+                    let mut prev = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, 0));
+                    for i in 1..=crate::edit::RING_SEGMENTS {
+                        let cur = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, i));
+                        f.line(prev, cur, *col, 0.9, 2.6 * scale, 4.0);
+                        prev = cur;
                     }
                 }
-                HandleStyle::Move | HandleStyle::Scale => {
-                    for (axis, col) in AXIS_COL.iter().enumerate() {
-                        let tip = clip(&vp, centre.add(crate::edit::axis_vec(axis).scale(len)));
-                        f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
-                        f.dot(tip, 8.0 * scale, *col, 1.0, 4.0);
-                    }
-                    if style == HandleStyle::Scale {
-                        f.dot(c0, 7.0 * scale, [235.0, 235.0, 240.0], 1.0, 4.0);
-                    }
+            }
+            HandleStyle::Move | HandleStyle::Scale => {
+                for (axis, col) in AXIS_COL.iter().enumerate() {
+                    let tip = clip(&vp, centre.add(crate::edit::axis_vec(axis).scale(len)));
+                    f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
+                    f.dot(tip, 8.0 * scale, *col, 1.0, 4.0);
+                }
+                if style == HandleStyle::Scale {
+                    f.dot(c0, 7.0 * scale, [235.0, 235.0, 240.0], 1.0, 4.0);
                 }
             }
         }
     }
 }
 
-fn draw_edit_overlay(f: &mut Frame, scene: &Scene, e: &EditOverlay, vp: &M4, eye: V3, scale: f32) {
-    let mesh = scene.mesh;
+fn draw_edit_overlay(f: &mut Frame, mesh: &crate::mesh::Mesh, e: &EditOverlay, vp: &M4, eye: V3, scale: f32) {
     let visible_face: Vec<bool> = (0..mesh.faces.len()).map(|i| face_front_facing(mesh, i, eye)).collect();
 
     // Selected edges: explicit ones, or the outline of selected faces.
