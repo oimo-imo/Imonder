@@ -2,6 +2,7 @@ pub mod camera;
 pub mod edit;
 pub mod math;
 pub mod mesh;
+pub mod ops;
 pub mod render;
 
 use std::cell::Cell;
@@ -16,15 +17,51 @@ const MAX_HISTORY: usize = 100;
 const PICK_RADIUS: f32 = 0.035;
 const HANDLE_RADIUS: f32 = 0.045;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    Move,
+    Rotate,
+    Scale,
+    LoopCut,
+    None,
+}
+
+impl Tool {
+    pub fn from_i32(i: i32) -> Tool {
+        match i {
+            0 => Tool::Move,
+            1 => Tool::Rotate,
+            2 => Tool::Scale,
+            3 => Tool::LoopCut,
+            _ => Tool::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Drag {
+    Move(usize),
+    Scale(usize), // 0..3 axis, 3 = uniform
+    Rotate { axis: usize, last: (f32, f32) },
+}
+
+/// The last operation, kept so its value can be adjusted by redoing it from `base`.
+struct LastOp {
+    kind: ops::OpKind,
+    base: Snapshot,
+    param: f32,
+}
+
 pub struct Core {
     pub camera: Camera,
     pub mesh: Mesh,
     pub edit_mode: bool,
-    pub show_handles: bool,
+    pub tool: Tool,
     pub sel: Selection,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
-    drag_axis: Option<usize>,
+    drag: Option<Drag>,
+    last_op: Option<LastOp>,
     aspect: Cell<f32>,
 }
 
@@ -34,11 +71,12 @@ impl Core {
             camera: Camera::default(),
             mesh: Mesh::cube(1.0),
             edit_mode: false,
-            show_handles: false,
+            tool: Tool::Move,
             sel: Selection::new(SelectMode::Face),
             undo: Vec::new(),
             redo: Vec::new(),
-            drag_axis: None,
+            drag: None,
+            last_op: None,
             aspect: Cell::new(1.0),
         }
     }
@@ -47,8 +85,18 @@ impl Core {
         View::new(&self.camera, self.aspect.get())
     }
 
-    fn handle_geometry(&self) -> Option<(V3, f32)> {
-        if !(self.edit_mode && self.show_handles) {
+    fn handle_style(&self) -> Option<render::HandleStyle> {
+        match self.tool {
+            Tool::Move => Some(render::HandleStyle::Move),
+            Tool::Rotate => Some(render::HandleStyle::Rotate),
+            Tool::Scale => Some(render::HandleStyle::Scale),
+            _ => None,
+        }
+    }
+
+    fn handle_geometry(&self) -> Option<(V3, f32, render::HandleStyle)> {
+        let style = self.handle_style()?;
+        if !self.edit_mode {
             return None;
         }
         let verts = self.sel.affected_verts(&self.mesh);
@@ -56,7 +104,7 @@ impl Core {
             return None;
         }
         let sum = verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(self.mesh.verts[i as usize]));
-        Some((sum.scale(1.0 / verts.len() as f32), self.camera.distance * 0.18))
+        Some((sum.scale(1.0 / verts.len() as f32), self.camera.distance * 0.18, style))
     }
 
     pub fn render(&self, w: usize, h: usize, scale: f32, out: &mut [u8]) {
@@ -69,22 +117,43 @@ impl Core {
 
     pub fn set_edit_mode(&mut self, on: bool) {
         self.edit_mode = on;
-        self.drag_axis = None;
+        self.drag = None;
+        self.last_op = None;
     }
 
     pub fn set_select_mode(&mut self, mode: SelectMode) {
         if self.sel.mode != mode {
             self.sel = Selection::new(mode);
+            self.last_op = None;
         }
     }
 
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.drag = None;
+    }
+
+    pub fn select_all(&mut self) {
+        self.sel = ops::select_all(&self.mesh, self.sel.mode);
+        self.last_op = None;
+    }
+
     /// Selects the element under (`nx`,`ny`) (fractions of width / height). Returns whether anything was hit.
+    /// With the Loop Cut tool, tapping an edge cuts along its ring right away.
     pub fn tap(&mut self, nx: f32, ny: f32, add: bool) -> bool {
         if !self.edit_mode {
             return false;
         }
+        self.last_op = None;
         let view = self.view();
         let p = (nx * view.aspect, ny);
+        if self.tool == Tool::LoopCut {
+            self.set_select_mode(SelectMode::Edge);
+            let Some(e) = edit::pick_edge(&self.mesh, &view, p, PICK_RADIUS) else { return false };
+            self.sel.clear();
+            self.sel.edges.insert(e);
+            return self.op_begin(ops::OpKind::LoopCut);
+        }
         let hit = match self.sel.mode {
             SelectMode::Vertex => edit::pick_vertex(&self.mesh, &view, p, PICK_RADIUS).map(Hit::Vert),
             SelectMode::Edge => edit::pick_edge(&self.mesh, &view, p, PICK_RADIUS).map(Hit::Edge),
@@ -123,7 +192,8 @@ impl Core {
         self.redo.push(Snapshot { mesh: self.mesh.clone(), sel: self.sel.clone() });
         self.mesh = prev.mesh;
         self.sel = prev.sel;
-        self.drag_axis = None;
+        self.drag = None;
+        self.last_op = None;
         true
     }
 
@@ -132,51 +202,165 @@ impl Core {
         self.undo.push(Snapshot { mesh: self.mesh.clone(), sel: self.sel.clone() });
         self.mesh = next.mesh;
         self.sel = next.sel;
-        self.drag_axis = None;
+        self.drag = None;
+        self.last_op = None;
         true
     }
 
-    /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected.
+    /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected,
+    /// bit 3: an adjustable operation is active, bits 4-5: select mode (0 vertex, 1 edge, 2 face).
     pub fn status(&self) -> i32 {
-        (!self.undo.is_empty()) as i32 | ((!self.redo.is_empty()) as i32) << 1 | ((!self.sel.is_empty()) as i32) << 2
+        (!self.undo.is_empty()) as i32
+            | ((!self.redo.is_empty()) as i32) << 1
+            | ((!self.sel.is_empty()) as i32) << 2
+            | (self.last_op.is_some() as i32) << 3
+            | (match self.sel.mode {
+                SelectMode::Vertex => 0,
+                SelectMode::Edge => 1,
+                SelectMode::Face => 2,
+            }) << 4
     }
 
-    /// Starts dragging a move handle if one is under the point. Records an undo step.
-    pub fn drag_begin(&mut self, nx: f32, ny: f32) -> bool {
-        let Some((centre, len)) = self.handle_geometry() else { return false };
-        let view = self.view();
-        let Some(axis) = edit::pick_handle(&view, centre, len, (nx * view.aspect, ny), HANDLE_RADIUS) else {
+    // ------------------------------------------------------------------ operations --
+
+    /// Runs an operation on the selection with its default value. Returns false if it does not apply.
+    pub fn op_begin(&mut self, kind: ops::OpKind) -> bool {
+        if !self.edit_mode {
             return false;
-        };
+        }
+        let param = kind.range().map_or(0.0, |r| r.2);
+        let Some((mesh, sel)) = ops::apply(kind, &self.mesh, &self.sel, param) else { return false };
+        let base = Snapshot { mesh: self.mesh.clone(), sel: self.sel.clone() };
         self.push_undo();
-        self.drag_axis = Some(axis);
+        self.mesh = mesh;
+        self.sel = sel;
+        self.last_op = kind.range().map(|_| LastOp { kind, base, param });
         true
     }
 
-    /// Moves the selection along the grabbed axis. Deltas are fractions of width / height.
-    pub fn drag_update(&mut self, dnx: f32, dny: f32) {
-        let (Some(axis), Some((centre, _))) = (self.drag_axis, self.handle_geometry()) else { return };
+    /// Re-runs the active operation from its base state with a new value.
+    pub fn op_adjust(&mut self, value: f32) -> bool {
+        let Some(l) = &mut self.last_op else { return false };
+        let (lo, hi, _, int) = l.kind.range().unwrap_or((0.0, 1.0, 0.0, false));
+        let v = value.clamp(lo, hi);
+        l.param = if int { v.round() } else { v };
+        let Some((mesh, sel)) = ops::apply(l.kind, &l.base.mesh, &l.base.sel, l.param) else { return false };
+        self.mesh = mesh;
+        self.sel = sel;
+        true
+    }
+
+    /// (min, max, current, is_integer) of the active operation's value.
+    pub fn op_range(&self) -> Option<(f32, f32, f32, bool)> {
+        let l = self.last_op.as_ref()?;
+        let (lo, hi, _, int) = l.kind.range()?;
+        Some((lo, hi, l.param, int))
+    }
+
+    pub fn op_commit(&mut self) {
+        self.last_op = None;
+    }
+
+    // ------------------------------------------------------------------- transforms --
+
+    /// Starts dragging a transform handle if one is under the point. Records an undo step.
+    pub fn drag_begin(&mut self, nx: f32, ny: f32) -> bool {
+        let Some((centre, len, style)) = self.handle_geometry() else { return false };
         let view = self.view();
-        let mut unit = [0.0f32; 3];
-        unit[axis] = 1.0;
-        let dir = math::v3(unit[0], unit[1], unit[2]);
-        let (Some(a), Some(b)) = (view.project(centre), view.project(centre.add(dir))) else { return };
-        let s = (b.0 - a.0, b.1 - a.1);
-        let s2 = s.0 * s.0 + s.1 * s.1;
-        if s2 < 1e-5 {
-            return; // axis points at the camera: no meaningful screen direction
-        }
+        let p = (nx * view.aspect, ny);
+        let drag = match style {
+            render::HandleStyle::Move => edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(Drag::Move),
+            render::HandleStyle::Scale => {
+                let near_centre = view
+                    .project(centre)
+                    .map_or(false, |c| ((c.0 - p.0).powi(2) + (c.1 - p.1).powi(2)).sqrt() < HANDLE_RADIUS * 0.8);
+                if near_centre {
+                    Some(Drag::Scale(3))
+                } else {
+                    edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(Drag::Scale)
+                }
+            }
+            render::HandleStyle::Rotate => {
+                edit::pick_ring(&view, centre, len * 0.9, p, HANDLE_RADIUS * 0.7).map(|axis| Drag::Rotate { axis, last: p })
+            }
+        };
+        let Some(drag) = drag else { return false };
+        self.last_op = None;
+        self.push_undo();
+        self.drag = Some(drag);
+        true
+    }
+
+    /// Applies a drag step. Deltas are fractions of width / height.
+    pub fn drag_update(&mut self, dnx: f32, dny: f32) {
+        let (Some(drag), Some((centre, len, _))) = (self.drag, self.handle_geometry()) else { return };
+        let view = self.view();
         let d = (dnx * view.aspect, dny);
-        let t = (d.0 * s.0 + d.1 * s.1) / s2;
-        for vi in self.sel.affected_verts(&self.mesh) {
-            let v = &mut self.mesh.verts[vi as usize];
-            *v = v.add(dir.scale(t));
+        let verts = self.sel.affected_verts(&self.mesh);
+        match drag {
+            Drag::Move(axis) => {
+                let Some(t) = axis_drag(&view, centre, axis, d) else { return };
+                let dir = edit::axis_vec(axis);
+                for vi in verts {
+                    let v = &mut self.mesh.verts[vi as usize];
+                    *v = v.add(dir.scale(t));
+                }
+            }
+            Drag::Scale(axis) => {
+                let f = if axis == 3 {
+                    1.0 + (d.0 - d.1) * 2.0
+                } else {
+                    let Some(t) = axis_drag(&view, centre, axis, d) else { return };
+                    1.0 + t / len
+                }
+                .max(0.05);
+                let k = edit::axis_vec(axis.min(2));
+                for vi in verts {
+                    let v = &mut self.mesh.verts[vi as usize];
+                    let rel = v.sub(centre);
+                    *v = if axis == 3 { centre.add(rel.scale(f)) } else { centre.add(rel.add(k.scale(k.dot(rel) * (f - 1.0)))) };
+                }
+            }
+            Drag::Rotate { axis, last } => {
+                let Some(c) = view.project(centre) else { return };
+                let now = (last.0 + d.0, last.1 + d.1);
+                // Screen angles with y pointing up, so counter-clockwise is positive.
+                let ang = |p: (f32, f32)| (-(p.1 - c.1)).atan2(p.0 - c.0);
+                let mut da = ang(now) - ang(last);
+                while da > std::f32::consts::PI {
+                    da -= std::f32::consts::TAU;
+                }
+                while da < -std::f32::consts::PI {
+                    da += std::f32::consts::TAU;
+                }
+                let k = edit::axis_vec(axis);
+                if view.eye.sub(centre).dot(k) < 0.0 {
+                    da = -da; // seen from the negative side the rotation looks reversed
+                }
+                for vi in verts {
+                    let v = &mut self.mesh.verts[vi as usize];
+                    *v = edit::rotate_about(*v, centre, k, da);
+                }
+                self.drag = Some(Drag::Rotate { axis, last: now });
+            }
         }
     }
 
     pub fn drag_end(&mut self) {
-        self.drag_axis = None;
+        self.drag = None;
     }
+}
+
+/// How far (in world units) a screen drag `d` moves along `axis` at `centre`.
+fn axis_drag(view: &View, centre: V3, axis: usize, d: (f32, f32)) -> Option<f32> {
+    let dir = edit::axis_vec(axis);
+    let (a, b) = (view.project(centre)?, view.project(centre.add(dir))?);
+    let s = (b.0 - a.0, b.1 - a.1);
+    let s2 = s.0 * s.0 + s.1 * s.1;
+    if s2 < 1e-5 {
+        return None; // axis points at the camera: no meaningful screen direction
+    }
+    Some((d.0 * s.0 + d.1 * s.1) / s2)
 }
 
 enum Hit {
@@ -190,13 +374,6 @@ fn toggle<T: Ord>(set: &mut std::collections::BTreeSet<T>, v: T, add: bool) {
         set.remove(&v);
     } else {
         set.insert(v);
-    }
-}
-
-#[cfg(test)]
-impl Core {
-    fn set_move_tool_for_test(&mut self) {
-        self.show_handles = true;
     }
 }
 
@@ -301,14 +478,71 @@ pub unsafe extern "C" fn imonder_set_select_mode(core: *mut Core, mode: i32) {
     }
 }
 
-/// Shows the move handles on the selection (the Move tool is active).
+/// 0 move, 1 rotate, 2 scale, 3 loop cut, anything else: no tool.
 ///
 /// # Safety
 /// `core` must be a live pointer from `imonder_create`.
 #[no_mangle]
-pub unsafe extern "C" fn imonder_set_move_tool(core: *mut Core, on: i32) {
+pub unsafe extern "C" fn imonder_set_tool(core: *mut Core, tool: i32) {
     if let Some(c) = core.as_mut() {
-        c.show_handles = on != 0;
+        c.set_tool(Tool::from_i32(tool));
+    }
+}
+
+/// Selects everything of the current select mode.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_select_all(core: *mut Core) {
+    if let Some(c) = core.as_mut() {
+        c.select_all();
+    }
+}
+
+/// Runs an operation (0 extrude, 1 inset, 2 loop cut, 3 bevel, 4 merge, 5 delete) on the selection.
+/// Returns 1 on success, 0 if it does not apply to the current selection.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_op_begin(core: *mut Core, kind: i32) -> i32 {
+    let (Some(c), Some(k)) = (core.as_mut(), ops::OpKind::from_i32(kind)) else { return 0 };
+    c.op_begin(k) as i32
+}
+
+/// Changes the value of the active operation and recomputes it.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_op_adjust(core: *mut Core, value: f32) -> i32 {
+    core.as_mut().map_or(0, |c| c.op_adjust(value) as i32)
+}
+
+/// Writes [min, max, current, is_integer] of the active operation into `out[0..4]`. Returns 0 if none.
+///
+/// # Safety
+/// `core` must be live and `out` must point to four writable `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_op_range(core: *const Core, out: *mut f32) -> i32 {
+    let (Some(c), false) = (core.as_ref(), out.is_null()) else { return 0 };
+    let Some((lo, hi, cur, int)) = c.op_range() else { return 0 };
+    *out = lo;
+    *out.add(1) = hi;
+    *out.add(2) = cur;
+    *out.add(3) = int as i32 as f32;
+    1
+}
+
+/// Finishes the active operation (it can no longer be adjusted).
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_op_commit(core: *mut Core) {
+    if let Some(c) = core.as_mut() {
+        c.op_commit();
     }
 }
 
@@ -362,7 +596,8 @@ pub unsafe extern "C" fn imonder_redo(core: *mut Core) -> i32 {
     core.as_mut().map_or(0, |c| c.redo() as i32)
 }
 
-/// Bit 0: can undo, bit 1: can redo, bit 2: something is selected.
+/// Bit 0: can undo, bit 1: can redo, bit 2: something is selected, bit 3: adjustable operation
+/// active, bits 4-5: select mode.
 ///
 /// # Safety
 /// `core` must be a live pointer from `imonder_create`.
@@ -502,11 +737,10 @@ mod tests {
     #[test]
     fn move_along_x_and_undo_redo() {
         let mut c = front_core();
-        c.set_move_tool_for_test();
         c.tap(0.5, 0.5, false);
         let before = c.mesh.verts.clone();
         let view = c.view();
-        let (centre, len) = c.handle_geometry().unwrap();
+        let (centre, len, _) = c.handle_geometry().unwrap();
         let tip = view.project(centre.add(math::v3(len, 0.0, 0.0))).unwrap();
         // Grab the X handle near its tip, drag 0.1 of the width to the right.
         assert!(c.drag_begin(tip.0 / view.aspect, tip.1));
@@ -525,10 +759,117 @@ mod tests {
         assert!(!c.redo());
     }
 
+    /// Grabs the handle of `axis` near its tip and drags by (`dx`,`dy`) viewport fractions.
+    fn drag_axis_tip(c: &mut Core, axis: usize, dx: f32, dy: f32) {
+        let view = c.view();
+        let (centre, len, _) = c.handle_geometry().unwrap();
+        let tip = view.project(centre.add(edit::axis_vec(axis).scale(len))).unwrap();
+        assert!(c.drag_begin(tip.0 / view.aspect, tip.1), "handle {axis} not grabbed");
+        c.drag_update(dx, dy);
+        c.drag_end();
+    }
+
+    fn selected_centre(c: &Core) -> V3 {
+        let v = c.sel.affected_verts(&c.mesh);
+        v.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(c.mesh.verts[i as usize])).scale(1.0 / v.len() as f32)
+    }
+
+    #[test]
+    fn scale_along_axis_keeps_centre() {
+        let mut c = front_core();
+        c.set_tool(Tool::Scale);
+        c.tap(0.5, 0.5, false);
+        let centre = selected_centre(&c);
+        drag_axis_tip(&mut c, 0, 0.1, 0.0);
+        let after = selected_centre(&c);
+        assert!((after.x - centre.x).abs() < 1e-4 && (after.z - centre.z).abs() < 1e-4);
+        let xs: Vec<f32> = c.sel.affected_verts(&c.mesh).iter().map(|&i| c.mesh.verts[i as usize].x).collect();
+        let width = xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(width > 2.05, "selected face got wider: {width}");
+        assert!(c.undo());
+        assert_eq!(c.mesh.verts, Mesh::cube(1.0).verts);
+    }
+
+    #[test]
+    fn rotate_ring_turns_the_selection() {
+        let mut c = front_core();
+        c.set_tool(Tool::Rotate);
+        c.tap(0.5, 0.5, false);
+        let centre = selected_centre(&c);
+        let view = c.view();
+        let (_, len, _) = c.handle_geometry().unwrap();
+        // The Y ring (around the viewing axis) seen face-on: grab it at the top and drag sideways (along its tangent).
+        let p = view.project(edit::ring_point(centre, 1, len * 0.9, 0)).unwrap();
+        assert!(c.drag_begin(p.0 / view.aspect, p.1));
+        c.drag_update(0.08, 0.0);
+        c.drag_end();
+        let moved = c.mesh.verts.iter().zip(&Mesh::cube(1.0).verts).filter(|(a, b)| a.sub(**b).len() > 1e-3).count();
+        assert_eq!(moved, 4);
+        let after = selected_centre(&c);
+        assert!(after.sub(centre).len() < 1e-4, "rotation is about the selection centre");
+        // Distances to the centre are preserved.
+        for &i in &c.sel.affected_verts(&c.mesh) {
+            let d = c.mesh.verts[i as usize].sub(centre).len();
+            assert!((d - 2.0f32.sqrt()).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn operation_can_be_adjusted_and_undone() {
+        let mut c = front_core();
+        c.tap(0.5, 0.5, false); // -Y face
+        assert!(c.op_begin(ops::OpKind::Extrude));
+        assert_eq!(c.mesh.faces.len(), 10);
+        assert_eq!(c.status() & 8, 8);
+        let (lo, hi, cur, int) = c.op_range().unwrap();
+        assert_eq!((lo, hi, cur, int), (-2.0, 2.0, 0.5, false));
+        let y = |c: &Core| c.mesh.verts.iter().map(|v| v.y).fold(f32::MAX, f32::min);
+        assert!((y(&c) + 1.5).abs() < 1e-4);
+        assert!(c.op_adjust(1.0));
+        assert!((y(&c) + 2.0).abs() < 1e-4, "extruded further");
+        assert_eq!(c.mesh.faces.len(), 10, "adjusting recomputes, it does not stack");
+        assert!(c.undo(), "one undo removes the whole operation");
+        assert_eq!(c.mesh.faces.len(), 6);
+        assert_eq!(c.status() & 8, 0);
+    }
+
+    #[test]
+    fn loop_cut_tool_cuts_on_tap() {
+        let mut c = front_core();
+        c.set_tool(Tool::LoopCut);
+        let view = c.view();
+        let mid = c.mesh.verts[0].add(c.mesh.verts[4]).scale(0.5); // a vertical edge at the front-left
+        let p = view.project(mid).unwrap();
+        assert!(c.tap(p.0 / view.aspect, p.1, false));
+        assert_eq!(c.mesh.faces.len(), 10);
+        assert_eq!(c.sel.mode, SelectMode::Edge);
+        assert!(c.op_adjust(3.0));
+        assert_eq!(c.mesh.faces.len(), 18);
+    }
+
+    #[test]
+    fn inapplicable_operation_changes_nothing() {
+        let mut c = front_core();
+        c.set_select_mode(SelectMode::Vertex);
+        c.tap(0.5, 0.5, false);
+        assert!(!c.op_begin(ops::OpKind::Extrude));
+        assert_eq!(c.status() & 1, 0, "no undo step recorded");
+    }
+
+    #[test]
+    fn select_all_and_delete() {
+        let mut c = front_core();
+        c.select_all();
+        assert_eq!(c.sel.faces.len(), 6);
+        assert!(c.op_begin(ops::OpKind::Delete));
+        assert!(c.mesh.faces.is_empty());
+        assert!(c.undo());
+        assert_eq!(c.mesh.faces.len(), 6);
+    }
+
     #[test]
     fn drag_without_handle_hit_does_nothing() {
         let mut c = front_core();
-        c.set_move_tool_for_test();
         c.tap(0.5, 0.5, false);
         assert!(!c.drag_begin(0.02, 0.02));
         assert_eq!(c.status() & 1, 0);
@@ -537,6 +878,7 @@ mod tests {
     #[test]
     fn selection_renders_accent() {
         let mut c = front_core();
+        c.set_tool(Tool::None); // handles would cover the sampled pixel
         let mut a = vec![0u8; 400 * 300 * 4];
         let mut b = vec![0u8; 400 * 300 * 4];
         c.render(400, 300, 1.0, &mut a);

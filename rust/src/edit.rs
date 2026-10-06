@@ -203,3 +203,52 @@ pub fn pick_handle(view: &View, centre: V3, len: f32, p: (f32, f32), radius: f32
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(a, _)| a)
 }
+
+/// Unit vector for axis 0/1/2.
+pub fn axis_vec(axis: usize) -> V3 {
+    match axis {
+        0 => v3(1.0, 0.0, 0.0),
+        1 => v3(0.0, 1.0, 0.0),
+        _ => v3(0.0, 0.0, 1.0),
+    }
+}
+
+/// Two unit vectors spanning the plane perpendicular to `axis`.
+pub fn ring_basis(axis: usize) -> (V3, V3) {
+    let k = axis_vec(axis);
+    let u = if axis == 2 { v3(1.0, 0.0, 0.0) } else { v3(0.0, 0.0, 1.0) };
+    let u = u.sub(k.scale(u.dot(k))).norm();
+    (u, k.cross(u))
+}
+
+pub const RING_SEGMENTS: usize = 48;
+
+pub fn ring_point(centre: V3, axis: usize, radius: f32, i: usize) -> V3 {
+    let (u, w) = ring_basis(axis);
+    let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
+    centre.add(u.scale(a.cos() * radius)).add(w.scale(a.sin() * radius))
+}
+
+/// Which rotation ring lies under `p`.
+pub fn pick_ring(view: &View, centre: V3, radius: f32, p: (f32, f32), tol: f32) -> Option<usize> {
+    (0..3)
+        .filter_map(|axis| {
+            let mut best = f32::MAX;
+            let mut prev = view.project(ring_point(centre, axis, radius, 0))?;
+            for i in 1..=RING_SEGMENTS {
+                let cur = view.project(ring_point(centre, axis, radius, i))?;
+                best = best.min(dist_to_segment(p, (prev.0, prev.1), (cur.0, cur.1)));
+                prev = cur;
+            }
+            (best <= tol).then_some((axis, best))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(a, _)| a)
+}
+
+/// Rodrigues rotation of `p` around the line through `c` along `axis`.
+pub fn rotate_about(p: V3, c: V3, axis: V3, angle: f32) -> V3 {
+    let v = p.sub(c);
+    let (s, co) = angle.sin_cos();
+    c.add(v.scale(co)).add(axis.cross(v).scale(s)).add(axis.scale(axis.dot(v) * (1.0 - co)))
+}

@@ -28,7 +28,7 @@ void main() {
     core.snapAxis(3); // front
     core.setEditMode(true);
     core.setSelectMode(2);
-    core.setMoveTool(true);
+    core.setTool(0);
     core.render(400, 300, 1.0); // records the aspect ratio
     expect(core.status() & 4, 0);
     expect(core.tap(0.5, 0.5), isTrue);
@@ -36,6 +36,27 @@ void main() {
     expect(core.tap(0.01, 0.01), isFalse);
     expect(core.status() & 4, 0);
     expect(core.undo(), isFalse);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
+
+  test('operations: extrude, adjust, range, undo', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.snapAxis(3);
+    core.setEditMode(true);
+    core.setSelectMode(2);
+    core.render(400, 300, 1.0);
+    expect(core.opBegin(0), isFalse, reason: 'nothing selected');
+    core.tap(0.5, 0.5);
+    expect(core.opBegin(0), isTrue);
+    expect(core.status() & 8, 8);
+    final r = core.opRange()!;
+    expect((r.$1, r.$2, r.$3, r.$4), (-2.0, 2.0, 0.5, false));
+    expect(core.opAdjust(1.0), isTrue);
+    expect(core.opRange()!.$3, 1.0);
+    expect(core.undo(), isTrue);
+    expect(core.status() & 8, 0);
+    expect(core.opRange(), isNull);
+    core.setTool(3);
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
 }

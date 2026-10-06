@@ -160,10 +160,17 @@ fn clip(m: &M4, p: V3) -> Clip {
 }
 
 /// Edit-mode overlay: selection highlight, vertex dots and move handles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandleStyle {
+    Move,
+    Rotate,
+    Scale,
+}
+
 pub struct EditOverlay<'a> {
     pub sel: &'a Selection,
-    /// Centre and world length of the move handles, if they should be drawn.
-    pub handles: Option<(V3, f32)>,
+    /// Transform handles: centre, world length and style, if they should be drawn.
+    pub handles: Option<(V3, f32, HandleStyle)>,
 }
 
 pub struct Scene<'a> {
@@ -256,14 +263,29 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
 
     if let Some(e) = &scene.edit {
         draw_edit_overlay(&mut f, scene, e, &vp, eye, scale);
-        if let Some((centre, len)) = e.handles {
+        if let Some((centre, len, style)) = e.handles {
             let c0 = clip(&vp, centre);
-            for (axis, col) in AXIS_COL.iter().enumerate() {
-                let mut d = [0.0f32; 3];
-                d[axis] = len;
-                let tip = clip(&vp, centre.add(v3(d[0], d[1], d[2])));
-                f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
-                f.dot(tip, 8.0 * scale, *col, 1.0, 4.0);
+            match style {
+                HandleStyle::Rotate => {
+                    for (axis, col) in AXIS_COL.iter().enumerate() {
+                        let mut prev = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, 0));
+                        for i in 1..=crate::edit::RING_SEGMENTS {
+                            let cur = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, i));
+                            f.line(prev, cur, *col, 0.9, 2.6 * scale, 4.0);
+                            prev = cur;
+                        }
+                    }
+                }
+                HandleStyle::Move | HandleStyle::Scale => {
+                    for (axis, col) in AXIS_COL.iter().enumerate() {
+                        let tip = clip(&vp, centre.add(crate::edit::axis_vec(axis).scale(len)));
+                        f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
+                        f.dot(tip, 8.0 * scale, *col, 1.0, 4.0);
+                    }
+                    if style == HandleStyle::Scale {
+                        f.dot(c0, 7.0 * scale, [235.0, 235.0, 240.0], 1.0, 4.0);
+                    }
+                }
             }
         }
     }
