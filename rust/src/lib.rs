@@ -81,6 +81,29 @@ pub unsafe extern "C" fn imonder_snap_view(core: *mut Core, preset: i32) {
     }
 }
 
+/// Snaps the view to look along a world axis (0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z).
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_snap_axis(core: *mut Core, axis: i32) {
+    if let Some(c) = core.as_mut() {
+        c.camera.snap_axis(axis);
+    }
+}
+
+/// Writes the camera yaw and pitch (radians) into `out[0..2]`.
+///
+/// # Safety
+/// `core` must be live and `out` must point to two writable `f32`s.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_get_angles(core: *const Core, out: *mut f32) {
+    if let (Some(c), false) = (core.as_ref(), out.is_null()) {
+        *out = c.camera.yaw;
+        *out.add(1) = c.camera.pitch;
+    }
+}
+
 /// Renders RGBA8 into `out` (`w*h*4` bytes). Returns 1 on success.
 ///
 /// # Safety
@@ -139,6 +162,38 @@ mod tests {
         assert!(c.distance >= 0.5);
         c.zoom(1e-6);
         assert!(c.distance <= 200.0);
+    }
+
+    #[test]
+    fn snap_axis_looks_along_axis() {
+        let mut c = Camera::default();
+        for (axis, want) in [
+            (0, [1.0, 0.0, 0.0]),
+            (1, [-1.0, 0.0, 0.0]),
+            (2, [0.0, 1.0, 0.0]),
+            (3, [0.0, -1.0, 0.0]),
+            (4, [0.0, 0.0, 1.0]),
+            (5, [0.0, 0.0, -1.0]),
+        ] {
+            c.snap_axis(axis);
+            let d = c.eye().sub(c.target).norm();
+            assert!(
+                (d.x - want[0]).abs() < 0.05 && (d.y - want[1]).abs() < 0.05 && (d.z - want[2]).abs() < 0.05,
+                "axis {axis}: {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ffi_angles() {
+        unsafe {
+            let c = imonder_create();
+            imonder_snap_axis(c, 0);
+            let mut a = [9.0f32; 2];
+            imonder_get_angles(c, a.as_mut_ptr());
+            assert_eq!(a, [0.0, 0.0]);
+            imonder_destroy(c);
+        }
     }
 
     #[test]
