@@ -2,6 +2,7 @@
 //! It sits behind `render_scene` so a wgpu backend can replace it later.
 
 use crate::camera::Camera;
+use crate::edit::{edge_faces, face_front_facing, Selection, SelectMode};
 use crate::math::{v3, M4, V3};
 use crate::mesh::Mesh;
 
@@ -135,15 +136,43 @@ impl<'a> Frame<'a> {
             }
         }
     }
+
+    fn dot(&mut self, c: Clip, r: f32, col: [f32; 3], alpha: f32, bias: f32) {
+        if c.0[3] < 0.05 {
+            return;
+        }
+        let (x, y, z) = self.to_screen(c);
+        let ri = r.ceil() as i32 + 1;
+        for oy in -ri..=ri {
+            for ox in -ri..=ri {
+                let d = ((ox * ox + oy * oy) as f32).sqrt();
+                let a = (r + 0.5 - d).clamp(0.0, 1.0) * alpha;
+                if a > 0.0 {
+                    self.blend(x as i32 + ox, y as i32 + oy, z - bias, col, a, false);
+                }
+            }
+        }
+    }
 }
 
 fn clip(m: &M4, p: V3) -> Clip {
     Clip(m.apply(p))
 }
 
+/// Edit-mode overlay: selection highlight, vertex dots and move handles.
+pub struct EditOverlay<'a> {
+    pub sel: &'a Selection,
+    /// Centre and world length of the move handles, if they should be drawn.
+    pub handles: Option<(V3, f32)>,
+}
+
 pub struct Scene<'a> {
     pub mesh: &'a Mesh,
+    pub edit: Option<EditOverlay<'a>>,
 }
+
+const ACCENT: [f32; 3] = [242.0, 163.0, 94.0]; // #F2A35E
+const AXIS_COL: [[f32; 3]; 3] = [[229.0, 83.0, 75.0], [123.0, 200.0, 108.0], [91.0, 141.0, 239.0]];
 
 /// Renders into `rgba` (w*h*4, tightly packed). `scale` = device pixel ratio (line widths).
 pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32, rgba: &mut [u8]) {
@@ -175,7 +204,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
     // Faces: back-face cull, soft headlight + hemisphere shading (clay look).
     let mesh = scene.mesh;
     let light = eye.sub(cam.target).norm();
-    for face in &mesh.faces {
+    for (fi, face) in mesh.faces.iter().enumerate() {
         if face.len() < 3 {
             continue;
         }
@@ -191,7 +220,14 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
         let sky = nrm.z * 0.5 + 0.5;
         let k = 0.30 + 0.45 * head + 0.25 * sky;
         let base = [148.0, 148.0, 155.0]; // #94949B
-        let col = [base[0] * k * 1.15, base[1] * k * 1.15, base[2] * k * 1.15].map(|c: f32| c.min(255.0));
+        let mut col = [base[0] * k * 1.15, base[1] * k * 1.15, base[2] * k * 1.15].map(|c: f32| c.min(255.0));
+        if let Some(e) = &scene.edit {
+            if e.sel.mode == SelectMode::Face && e.sel.faces.contains(&fi) {
+                for c in 0..3 {
+                    col[c] = col[c] * 0.45 + ACCENT[c] * k.min(1.0) * 0.55;
+                }
+            }
+        }
         let c0 = clip(&vp, mesh.verts[face[0] as usize]);
         let mut prev = clip(&vp, mesh.verts[face[1] as usize]);
         for &i in &face[2..] {
@@ -216,6 +252,68 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
             let b = clip(&vp, mesh.verts[face[(k + 1) % face.len()] as usize]);
             f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, 0.0005);
         }
+    }
+
+    if let Some(e) = &scene.edit {
+        draw_edit_overlay(&mut f, scene, e, &vp, eye, scale);
+        if let Some((centre, len)) = e.handles {
+            let c0 = clip(&vp, centre);
+            for (axis, col) in AXIS_COL.iter().enumerate() {
+                let mut d = [0.0f32; 3];
+                d[axis] = len;
+                let tip = clip(&vp, centre.add(v3(d[0], d[1], d[2])));
+                f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
+                f.dot(tip, 8.0 * scale, *col, 1.0, 4.0);
+            }
+        }
+    }
+}
+
+fn draw_edit_overlay(f: &mut Frame, scene: &Scene, e: &EditOverlay, vp: &M4, eye: V3, scale: f32) {
+    let mesh = scene.mesh;
+    let visible_face: Vec<bool> = (0..mesh.faces.len()).map(|i| face_front_facing(mesh, i, eye)).collect();
+
+    // Selected edges: explicit ones, or the outline of selected faces.
+    let mut hot: Vec<(u32, u32)> = Vec::new();
+    match e.sel.mode {
+        SelectMode::Edge => hot.extend(e.sel.edges.iter().copied()),
+        SelectMode::Face => {
+            for &fi in &e.sel.faces {
+                if let Some(face) = mesh.faces.get(fi) {
+                    for k in 0..face.len() {
+                        hot.push(crate::edit::edge_key(face[k], face[(k + 1) % face.len()]));
+                    }
+                }
+            }
+        }
+        SelectMode::Vertex => {}
+    }
+    let edges = edge_faces(mesh);
+    for (a, b) in hot {
+        let vis = edges.get(&(a, b)).map_or(false, |fs| fs.iter().any(|&fi| visible_face[fi]));
+        if vis {
+            f.line(clip(vp, mesh.verts[a as usize]), clip(vp, mesh.verts[b as usize]), ACCENT, 1.0, 2.8 * scale, 0.002);
+        }
+    }
+
+    // Vertex dots (only on front-facing geometry).
+    let mut shown = std::collections::BTreeSet::new();
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        if visible_face[fi] {
+            shown.extend(face.iter().copied());
+        }
+    }
+    let affected = e.sel.affected_verts(mesh);
+    for vi in shown {
+        let sel = e.sel.mode == SelectMode::Vertex && e.sel.verts.contains(&vi);
+        let (r, col) = if sel {
+            (5.5 * scale, ACCENT)
+        } else if affected.contains(&vi) {
+            (4.0 * scale, ACCENT)
+        } else {
+            (3.2 * scale, [210.0, 210.0, 216.0])
+        };
+        f.dot(clip(vp, mesh.verts[vi as usize]), r, col, 1.0, 0.002);
     }
 }
 
