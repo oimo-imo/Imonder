@@ -81,6 +81,30 @@ impl M4 {
         ])
     }
 
+    /// Symmetric orthographic projection with half-width `hw` and half-height `hh`; clip z in [-1, 1].
+    pub fn orthographic(hw: f32, hh: f32, near: f32, far: f32) -> M4 {
+        M4([
+            [1.0 / hw, 0.0, 0.0, 0.0],
+            [0.0, 1.0 / hh, 0.0, 0.0],
+            [0.0, 0.0, -2.0 / (far - near), -(far + near) / (far - near)],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    }
+
+    /// Maps the sub-rectangle `rect` = (x0, y0, x1, y1) of the viewport (fractions, y down) onto
+    /// the whole clip space, so rendering with `crop * proj` shows exactly that part of the view.
+    pub fn crop(rect: [f32; 4]) -> M4 {
+        let [x0, y0, x1, y1] = rect;
+        let (sx, sy) = ((x1 - x0).max(1e-6), (y1 - y0).max(1e-6));
+        let (cx, cy) = (x0 + x1 - 1.0, 1.0 - (y0 + y1));
+        M4([
+            [1.0 / sx, 0.0, 0.0, -cx / sx],
+            [0.0, 1.0 / sy, 0.0, -cy / sy],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    }
+
     /// OpenGL-style perspective; clip z in [-w, w].
     pub fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> M4 {
         let t = 1.0 / (fovy * 0.5).tan();

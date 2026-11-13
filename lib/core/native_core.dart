@@ -25,6 +25,10 @@ typedef _Load = int Function(Pointer<Void>, Pointer<Uint8>, int);
 typedef _SetVisible = int Function(Pointer<Void>, int, int);
 typedef _Revision = int Function(Pointer<Void>);
 typedef _Thumb = int Function(Pointer<Void>, int, int, Pointer<Uint8>);
+typedef _Capture = void Function(Pointer<Void>, int, int, int);
+typedef _Preset = int Function(Pointer<Void>, int, double, double, double, double, double);
+typedef _FrameAll = void Function(Pointer<Void>, double, double, double, double, double);
+typedef _Export = int Function(Pointer<Void>, int, int, double, double, double, double, double, double, int, Pointer<Uint8>);
 
 /// One entry of the scene list.
 class SceneObject {
@@ -84,6 +88,14 @@ class NativeCore {
     _newWork = l.lookupFunction<Void Function(Pointer<Void>), _Void>('imonder_new_work');
     _revision = l.lookupFunction<Uint64 Function(Pointer<Void>), _Revision>('imonder_revision');
     _thumb = l.lookupFunction<Int32 Function(Pointer<Void>, Uint32, Uint32, Pointer<Uint8>), _Thumb>('imonder_render_thumbnail');
+    _setOrtho = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_ortho');
+    _setCapture = l.lookupFunction<Void Function(Pointer<Void>, Int32, Int32, Int32), _Capture>('imonder_set_capture');
+    _applyPreset = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Float, Float, Float, Float, Float), _Preset>(
+        'imonder_apply_preset');
+    _frameAll = l.lookupFunction<Void Function(Pointer<Void>, Float, Float, Float, Float, Float), _FrameAll>('imonder_frame_all');
+    _renderExport = l.lookupFunction<
+        Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Float, Float, Float, Float, Float, Int32, Pointer<Uint8>),
+        _Export>('imonder_render_export');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -125,6 +137,11 @@ class NativeCore {
   late final _Void _newWork;
   late final _Revision _revision;
   late final _Thumb _thumb;
+  late final _Flag _setOrtho;
+  late final _Capture _setCapture;
+  late final _Preset _applyPreset;
+  late final _FrameAll _frameAll;
+  late final _Export _renderExport;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -261,6 +278,35 @@ class NativeCore {
     final p = malloc<Uint8>(w * h * 4);
     try {
       return _thumb(_handle, w, h, p) == 1 ? Uint8List.fromList(p.asTypedList(w * h * 4)) : null;
+    } finally {
+      malloc.free(p);
+    }
+  }
+
+  // ------------------------------------------------------------------ capture --
+
+  void setOrtho(bool on) => _setOrtho(_handle, on ? 1 : 0);
+
+  /// Enter / leave capture mode. While on, the view shows exactly what an image will show.
+  void setCapture(bool on, {bool grid = true, bool edges = true}) =>
+      _setCapture(_handle, on ? 1 : 0, grid ? 1 : 0, edges ? 1 : 0);
+
+  /// Preset direction (0 diorama, 1 three-quarter, 2 front, 3 top, 4 side), framed so everything
+  /// fits inside [rect] (fractions of a view whose width/height is [viewAspect]).
+  bool applyPreset(int preset, double viewAspect, (double, double, double, double) rect) =>
+      _applyPreset(_handle, preset, viewAspect, rect.$1, rect.$2, rect.$3, rect.$4) == 1;
+
+  /// Zooms and centres (same direction) so everything fits inside [rect].
+  void frameAll(double viewAspect, (double, double, double, double) rect) =>
+      _frameAll(_handle, viewAspect, rect.$1, rect.$2, rect.$3, rect.$4);
+
+  /// RGBA image of what [rect] shows, at [w] x [h].
+  Uint8List? renderExport(int w, int h, double scale, double viewAspect, (double, double, double, double) rect,
+      {bool transparent = false}) {
+    final p = malloc<Uint8>(w * h * 4);
+    try {
+      final ok = _renderExport(_handle, w, h, scale, viewAspect, rect.$1, rect.$2, rect.$3, rect.$4, transparent ? 1 : 0, p);
+      return ok == 1 ? Uint8List.fromList(p.asTypedList(w * h * 4)) : null;
     } finally {
       malloc.free(p);
     }

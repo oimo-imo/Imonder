@@ -67,6 +67,27 @@ pub fn primitive(kind: i32) -> Option<(&'static str, Mesh)> {
     })
 }
 
+/// What a captured image shows besides the models.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaptureOpts {
+    pub grid: bool,
+    pub edges: bool,
+}
+
+/// Camera presets for capturing: (orthographic, yaw, pitch).
+/// 0 diorama (isometric, looking down at 35°), 1 three-quarter perspective, 2 front, 3 top, 4 side.
+pub fn capture_preset(preset: i32) -> Option<(bool, f32, f32)> {
+    use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+    Some(match preset {
+        0 => (true, -FRAC_PI_4, (1.0f32 / 2.0f32.sqrt()).atan()),
+        1 => (false, -FRAC_PI_4 - 0.3, 0.42),
+        2 => (true, -FRAC_PI_2, 0.0),
+        3 => (true, -FRAC_PI_2, 1.55),
+        4 => (true, 0.0, 0.0),
+        _ => return None,
+    })
+}
+
 pub struct Core {
     pub camera: Camera,
     pub scene: Scene,
@@ -79,6 +100,10 @@ pub struct Core {
     last_op: Option<LastOp>,
     aspect: Cell<f32>,
     rev: u64,
+    /// Capture mode: the view shows exactly what an exported image will look like.
+    capture: Option<CaptureOpts>,
+    /// The editing camera, put back when capture mode ends.
+    camera_before_capture: Option<Camera>,
 }
 
 impl Core {
@@ -95,6 +120,8 @@ impl Core {
             last_op: None,
             aspect: Cell::new(1.0),
             rev: 0,
+            capture: None,
+            camera_before_capture: None,
         }
     }
 
@@ -162,13 +189,124 @@ impl Core {
 
     pub fn render(&self, w: usize, h: usize, scale: f32, out: &mut [u8]) {
         self.aspect.set(w as f32 / h.max(1) as f32);
+        if let Some(c) = self.capture {
+            let opts = render::RenderOpts { grid: c.grid, edges: c.edges, vignette: false, ..Default::default() };
+            render::render_scene(&self.clean_scene(), &self.camera, w, h, scale, out, &opts);
+            return;
+        }
         let scene = render::Scene {
             objects: &self.scene.objects,
             active: self.scene.active,
             edit: self.edit_mode.then(|| render::EditOverlay { sel: &self.sel }),
             handles: self.handle_geometry(),
         };
-        render::render_scene(&scene, &self.camera, w, h, scale, out);
+        render::render_scene(&scene, &self.camera, w, h, scale, out, &render::RenderOpts::default());
+    }
+
+    /// The models only: no selection, handles or highlight.
+    fn clean_scene(&self) -> render::Scene<'_> {
+        render::Scene { objects: &self.scene.objects, active: usize::MAX, edit: None, handles: None }
+    }
+
+    // ------------------------------------------------------------------ capture --
+
+    pub fn set_ortho(&mut self, on: bool) {
+        self.camera.ortho = on;
+    }
+
+    /// Enters (Some) or leaves (None) capture mode, or changes its options. Selection tools are
+    /// off while capturing. Leaving restores the camera the editor had before.
+    pub fn set_capture(&mut self, opts: Option<CaptureOpts>) {
+        match (self.capture.is_some(), opts.is_some()) {
+            (false, true) => self.camera_before_capture = Some(self.camera),
+            (true, false) => {
+                if let Some(cam) = self.camera_before_capture.take() {
+                    self.camera = cam;
+                }
+            }
+            _ => {}
+        }
+        self.capture = opts;
+        self.drag = None;
+        self.last_op = None;
+    }
+
+    /// Bounds of everything visible.
+    fn visible_bounds(&self) -> Option<(V3, V3)> {
+        let mut out: Option<(V3, V3)> = None;
+        for o in self.scene.objects.iter().filter(|o| o.visible) {
+            if let Some((a, b)) = o.mesh.bounds() {
+                out = Some(match out {
+                    None => (a, b),
+                    Some((lo, hi)) => (
+                        math::v3(lo.x.min(a.x), lo.y.min(a.y), lo.z.min(a.z)),
+                        math::v3(hi.x.max(b.x), hi.y.max(b.y), hi.z.max(b.z)),
+                    ),
+                });
+            }
+        }
+        out
+    }
+
+    /// Points the camera from a preset direction and zooms so every visible object fits inside
+    /// `rect` (fractions of a view with `view_aspect`), with a small margin.
+    pub fn apply_preset(&mut self, preset: i32, view_aspect: f32, rect: [f32; 4]) -> bool {
+        let Some((ortho, yaw, pitch)) = capture_preset(preset) else { return false };
+        self.camera.ortho = ortho;
+        self.camera.yaw = yaw;
+        self.camera.pitch = pitch;
+        self.frame_all(view_aspect, rect);
+        true
+    }
+
+    /// Zooms and pans so every visible object fits in `rect`, centred in it.
+    pub fn frame_all(&mut self, view_aspect: f32, rect: [f32; 4]) {
+        let Some((lo, hi)) = self.visible_bounds() else { return };
+        let centre = lo.add(hi).scale(0.5);
+        let corners: Vec<V3> = (0..8)
+            .map(|i| math::v3(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z }))
+            .collect();
+        // The frame's centre in clip space; the camera is panned so the model's centre lands there.
+        let (fx, fy) = (rect[0] + rect[2] - 1.0, 1.0 - (rect[1] + rect[3]));
+        let (right, up) = self.camera.basis();
+        let place = |cam: &mut Camera, d: f32| {
+            cam.distance = d;
+            let (hw, hh) = cam.half_extents(view_aspect);
+            cam.target = centre.sub(right.scale(fx * hw)).sub(up.scale(fy * hh));
+        };
+        const MARGIN: f32 = 0.82; // keep the model within 82% of the frame
+        let crop = math::M4::crop(rect);
+        let fits = |cam: &Camera| {
+            let m = crop.mul(&cam.proj(view_aspect)).mul(&cam.view());
+            corners.iter().all(|&p| {
+                let c = m.apply(p);
+                c[3] > 0.05 && (c[0] / c[3]).abs() <= MARGIN && (c[1] / c[3]).abs() <= MARGIN
+            })
+        };
+        // Fitting gets easier the further away (or zoomed out) the camera is: bisect.
+        let (mut near, mut far) = (0.5f32, 200.0f32);
+        let mut cam = self.camera;
+        place(&mut cam, far);
+        if fits(&cam) {
+            for _ in 0..40 {
+                let mid = (near * far).sqrt();
+                place(&mut cam, mid);
+                if fits(&cam) {
+                    far = mid;
+                } else {
+                    near = mid;
+                }
+            }
+        }
+        place(&mut cam, far);
+        self.camera = cam;
+    }
+
+    /// Renders the part of the view inside `rect` (as framed on screen) at `w` x `h`.
+    pub fn render_export(&self, w: usize, h: usize, scale: f32, view_aspect: f32, rect: [f32; 4], transparent: bool, out: &mut [u8]) {
+        let c = self.capture.unwrap_or(CaptureOpts { grid: true, edges: true });
+        let opts = render::RenderOpts { grid: c.grid, edges: c.edges, transparent, crop: Some((view_aspect, rect)), vignette: false };
+        render::render_scene(&self.clean_scene(), &self.camera, w, h, scale, out, &opts);
     }
 
     /// Renders the whole work from a fixed three-quarter view (for gallery thumbnails).
@@ -187,8 +325,7 @@ impl Core {
             let radius = hi.sub(lo).len() * 0.5;
             cam.distance = (radius / (cam.fovy * 0.5).tan() * 1.15).max(1.0);
         }
-        let scene = render::Scene { objects: &self.scene.objects, active: usize::MAX, edit: None, handles: None };
-        render::render_scene(&scene, &cam, w, h, 1.0, out);
+        render::render_scene(&self.clean_scene(), &cam, w, h, 1.0, out, &render::RenderOpts::default());
     }
 
     pub fn set_edit_mode(&mut self, on: bool) {
@@ -218,6 +355,9 @@ impl Core {
     /// Object mode: selects the object under the point. Returns whether anything was hit.
     /// With the Loop Cut tool, tapping an edge cuts along its ring right away.
     pub fn tap(&mut self, nx: f32, ny: f32, add: bool) -> bool {
+        if self.capture.is_some() {
+            return false;
+        }
         self.last_op = None;
         let view = self.view();
         let p = (nx * view.aspect, ny);
@@ -294,7 +434,7 @@ impl Core {
 
     /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected,
     /// bit 3: an adjustable operation is active, bits 4-5: select mode (0 vertex, 1 edge, 2 face),
-    /// bit 6: edit mode, bit 7: an object is active.
+    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode.
     pub fn status(&self) -> i32 {
         (!self.undo.is_empty()) as i32
             | ((!self.redo.is_empty()) as i32) << 1
@@ -307,6 +447,8 @@ impl Core {
             }) << 4
             | (self.edit_mode as i32) << 6
             | (self.scene.has_active() as i32) << 7
+            | (self.camera.ortho as i32) << 8
+            | (self.capture.is_some() as i32) << 9
     }
 
     // -------------------------------------------------------------------- objects --
@@ -443,6 +585,9 @@ impl Core {
 
     /// Starts dragging a transform handle if one is under the point. Records an undo step.
     pub fn drag_begin(&mut self, nx: f32, ny: f32) -> bool {
+        if self.capture.is_some() {
+            return false;
+        }
         let Some((centre, len, style)) = self.handle_geometry() else { return false };
         let view = self.view();
         let p = (nx * view.aspect, ny);
@@ -927,6 +1072,76 @@ pub unsafe extern "C" fn imonder_render_thumbnail(core: *const Core, w: u32, h: 
     1
 }
 
+/// Orthographic (1) or perspective (0) view.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_set_ortho(core: *mut Core, on: i32) {
+    if let Some(c) = core.as_mut() {
+        c.set_ortho(on != 0);
+    }
+}
+
+/// Enters (`on` = 1) or leaves capture mode; `grid` / `edges` choose what the image shows.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_set_capture(core: *mut Core, on: i32, grid: i32, edges: i32) {
+    if let Some(c) = core.as_mut() {
+        c.set_capture((on != 0).then_some(CaptureOpts { grid: grid != 0, edges: edges != 0 }));
+    }
+}
+
+/// Applies a capture preset (0 diorama, 1 three-quarter, 2 front, 3 top, 4 side) and frames every
+/// visible object inside the rect (x0, y0, x1, y1 as fractions of a view with `view_aspect`).
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_apply_preset(core: *mut Core, preset: i32, view_aspect: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> i32 {
+    core.as_mut().map_or(0, |c| c.apply_preset(preset, view_aspect, [x0, y0, x1, y1]) as i32)
+}
+
+/// Zooms and centres (keeping the direction) so every visible object fits inside the rect.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_frame_all(core: *mut Core, view_aspect: f32, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if let Some(c) = core.as_mut() {
+        c.frame_all(view_aspect, [x0, y0, x1, y1]);
+    }
+}
+
+/// Renders the framed part of the view into `out` (`w*h*4` RGBA bytes). Returns 1 on success.
+///
+/// # Safety
+/// `core` must be live and `out` must point to at least `w*h*4` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_render_export(
+    core: *const Core,
+    w: u32,
+    h: u32,
+    scale: f32,
+    view_aspect: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    transparent: i32,
+    out: *mut u8,
+) -> i32 {
+    let (Some(c), false) = (core.as_ref(), out.is_null()) else { return 0 };
+    if w == 0 || h == 0 || w > 8192 || h > 8192 || !(x1 > x0 && y1 > y0) {
+        return 0;
+    }
+    let buf = std::slice::from_raw_parts_mut(out, w as usize * h as usize * 4);
+    c.render_export(w as usize, h as usize, scale, view_aspect, [x0, y0, x1, y1], transparent != 0, buf);
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1512,114 @@ mod tests {
         let centre = &buf[(h / 2 * w + w / 2) * 4..][..3];
         let corner = &buf[..3];
         assert_ne!(centre, corner, "the cube is in the middle of the thumbnail");
+    }
+
+    #[test]
+    fn ortho_keeps_working_when_zoomed_into_the_model() {
+        let mut c = front_core();
+        c.set_ortho(true);
+        c.camera.distance = 0.6; // a perspective camera would now sit inside the cube
+        let mut buf = vec![0u8; 400 * 300 * 4];
+        c.render(400, 300, 1.0, &mut buf);
+        assert!(c.tap(0.5, 0.5, false));
+        assert_eq!(c.sel.faces.iter().copied().collect::<Vec<_>>(), vec![2], "still picks the front face");
+        assert_eq!(c.status() & 256, 256);
+        // Parallel projection: the front face is a perfect square on screen.
+        let view = c.view();
+        let p: Vec<_> = c.mesh().faces[2].iter().map(|&v| view.project(c.mesh().verts[v as usize]).unwrap()).collect();
+        let xs: Vec<f32> = p.iter().map(|q| q.0).collect();
+        let ys: Vec<f32> = p.iter().map(|q| q.1).collect();
+        let w = xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min);
+        let h = ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min);
+        assert!((w - h).abs() < 1e-3, "{w} vs {h}");
+    }
+
+    #[test]
+    fn export_of_the_whole_view_matches_the_screen() {
+        let mut c = object_core();
+        c.set_capture(Some(CaptureOpts { grid: true, edges: true }));
+        let (w, h) = (200, 150);
+        let mut screen = vec![0u8; w * h * 4];
+        let mut image = vec![0u8; w * h * 4];
+        c.render(w, h, 1.0, &mut screen);
+        c.render_export(w, h, 1.0, w as f32 / h as f32, [0.0, 0.0, 1.0, 1.0], false, &mut image);
+        assert_eq!(screen, image);
+    }
+
+    #[test]
+    fn export_of_a_square_frame_shows_the_frame_centre() {
+        let mut c = object_core();
+        c.set_capture(Some(CaptureOpts { grid: false, edges: false }));
+        let (vw, vh) = (300usize, 600usize);
+        let aspect = vw as f32 / vh as f32;
+        let mut screen = vec![0u8; vw * vh * 4];
+        c.render(vw, vh, 1.0, &mut screen);
+        // A square frame centred on screen: 300 px wide = 0.5 of the 600 px height.
+        let rect = [0.0, 0.25, 1.0, 0.75];
+        let mut img = vec![0u8; 300 * 300 * 4];
+        c.render_export(300, 300, 1.0, aspect, rect, false, &mut img);
+        let px = |b: &[u8], w: usize, x: usize, y: usize| b[(y * w + x) * 4..][..3].to_vec();
+        for (sx, sy, ix, iy) in [(150, 300, 150, 150), (60, 200, 60, 50), (240, 420, 240, 270)] {
+            let (a, b) = (px(&screen, vw, sx, sy), px(&img, 300, ix, iy));
+            let close = a.iter().zip(&b).all(|(p, q)| (*p as i32 - *q as i32).abs() <= 12);
+            assert!(close, "screen ({sx},{sy}) {a:?} vs image ({ix},{iy}) {b:?}");
+        }
+    }
+
+    #[test]
+    fn transparent_export_has_alpha_only_where_the_model_is() {
+        let mut c = object_core();
+        c.set_capture(Some(CaptureOpts { grid: false, edges: true }));
+        c.apply_preset(0, 1.0, [0.0, 0.0, 1.0, 1.0]);
+        let mut img = vec![0u8; 128 * 128 * 4];
+        c.render_export(128, 128, 1.0, 1.0, [0.0, 0.0, 1.0, 1.0], true, &mut img);
+        assert_eq!(img[3], 0, "corner is see-through");
+        assert_eq!(img[(64 * 128 + 64) * 4 + 3], 255, "the cube is opaque");
+    }
+
+    #[test]
+    fn diorama_preset_frames_everything_inside_the_rect() {
+        let mut c = object_core();
+        c.add_object(4);
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x += 6.0;
+            v.z += 2.0;
+        }
+        let aspect = 390.0 / 844.0;
+        let rect = [0.05, 0.3, 0.95, 0.716]; // a square on a phone screen
+        assert!(c.apply_preset(0, aspect, rect));
+        assert!(c.camera.ortho);
+        assert!((c.camera.pitch - 0.6155).abs() < 1e-3, "isometric angle");
+        let m = math::M4::crop(rect).mul(&c.camera.proj(aspect)).mul(&c.camera.view());
+        let mut max = 0.0f32;
+        for o in &c.scene.objects {
+            for &v in &o.mesh.verts {
+                let p = m.apply(v);
+                max = max.max((p[0] / p[3]).abs()).max((p[1] / p[3]).abs());
+            }
+        }
+        assert!(max <= 0.83 && max > 0.75, "fills the frame without spilling over: {max}");
+        // The model's centre sits in the middle of the frame, not of the screen.
+        let (lo, hi) = c.visible_bounds().unwrap();
+        let p = m.apply(lo.add(hi).scale(0.5));
+        assert!((p[0] / p[3]).abs() < 0.02 && (p[1] / p[3]).abs() < 0.02, "centred: {p:?}");
+        assert!(!c.apply_preset(42, aspect, rect));
+    }
+
+    #[test]
+    fn capture_mode_disables_selection_and_handles() {
+        let mut c = front_core();
+        c.set_capture(Some(CaptureOpts { grid: true, edges: true }));
+        assert!(!c.tap(0.5, 0.5, false));
+        assert!(!c.drag_begin(0.5, 0.5));
+        assert_eq!(c.status() & 512, 512);
+        c.apply_preset(3, 1.0, [0.0, 0.0, 1.0, 1.0]);
+        assert!(c.camera.ortho);
+        c.set_capture(Some(CaptureOpts { grid: false, edges: true })); // changing options keeps the shot
+        assert!(c.camera.ortho);
+        c.set_capture(None);
+        assert!(!c.camera.ortho && (c.camera.yaw + std::f32::consts::FRAC_PI_2).abs() < 1e-6, "editing view restored");
+        assert!(c.tap(0.5, 0.5, false));
     }
 
     #[test]

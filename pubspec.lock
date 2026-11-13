@@ -104,6 +104,14 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  gal:
+    dependency: "direct main"
+    description:
+      name: gal
+      sha256: "883aeeeb24662190b18ec588732d9e94fea4e5ca2af6ac26404c3843daae48c6"
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.0.0"
   hooks:
     dependency: transitive
     description:
@@ -455,4 +463,4 @@ packages:
     version: "3.1.4"
 sdks:
   dart: ">=3.13.5 <4.0.0"
-  flutter: ">=3.38.4"
+  flutter: ">=3.41.0"

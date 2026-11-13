@@ -99,7 +99,7 @@ pub struct View {
 
 impl View {
     pub fn new(cam: &Camera, aspect: f32) -> View {
-        View { vp: cam.proj(aspect).mul(&cam.view()), eye: cam.eye(), aspect }
+        View { vp: cam.proj(aspect).mul(&cam.view()), eye: cam.view_eye(), aspect }
     }
 
     pub fn project(&self, p: V3) -> Option<(f32, f32, f32)> {

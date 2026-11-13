@@ -99,4 +99,25 @@ void main() {
     core.dispose();
     other.dispose();
   }, skip: exists ? false : 'rust library not built');
+
+  test('capture: presets, ortho, cropped export', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.render(300, 600, 1.0);
+    core.setCapture(true, grid: false, edges: true);
+    expect(core.status() & 512, 512);
+    expect(core.applyPreset(0, 0.5, (0.0, 0.25, 1.0, 0.75)), isTrue);
+    expect(core.status() & 256, 256, reason: 'diorama is orthographic');
+    expect(core.applyPreset(9, 0.5, (0.0, 0.25, 1.0, 0.75)), isFalse);
+    core.frameAll(0.5, (0.0, 0.25, 1.0, 0.75));
+    final img = core.renderExport(64, 64, 1.0, 0.5, (0.0, 0.25, 1.0, 0.75), transparent: true)!;
+    expect(img.length, 64 * 64 * 4);
+    expect(img[3], 0, reason: 'transparent corner');
+    expect(img[(32 * 64 + 32) * 4 + 3], 255, reason: 'model in the middle');
+    expect(core.renderExport(64, 64, 1.0, 0.5, (0.5, 0.5, 0.5, 0.5)), isNull, reason: 'empty rect');
+    core.setCapture(false);
+    expect(core.status() & 256, 0, reason: 'editing camera restored');
+    core.setOrtho(true);
+    expect(core.status() & 256, 256);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
 }
