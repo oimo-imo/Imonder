@@ -6,7 +6,9 @@ import '../storage/work_session.dart';
 import '../storage/work_store.dart';
 import '../update/updater.dart';
 import 'capture_overlay.dart';
+import 'export_sheet.dart';
 import 'gallery_screen.dart';
+import 'modifier_sheet.dart';
 import 'presets.dart';
 import 'view_gizmo.dart';
 import 'viewport.dart';
@@ -19,12 +21,17 @@ const _muted = Color(0xFF8E8E95);
 const _bitEditMode = 64;
 const _bitHasActive = 128;
 const _bitOrtho = 256;
+const _bitMany = 2048;
+const _bitGrouped = 4096;
 
 class EditorScreen extends StatefulWidget {
-  const EditorScreen({super.key, this.saveCapture});
+  const EditorScreen({super.key, this.saveCapture, this.saveExport});
 
   /// Where captured images go (tests); the photo gallery when null.
   final Future<void> Function(Uint8List png, String name)? saveCapture;
+
+  /// Where exported models go (tests); the system save dialog when null.
+  final SaveFile? saveExport;
 
   @override
   State<EditorScreen> createState() => _EditorScreenState();
@@ -53,7 +60,9 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     _ToolDef(Icons.change_history, 'ベベル', op: 3, need: '辺を選んでください'),
     _ToolDef(Icons.call_merge, '結合', op: 4, need: '2つ以上の頂点・辺・面を選んでください'),
     _ToolDef(Icons.delete_outline, '削除', op: 5, need: '先に選択してください'),
+    _ToolDef(Icons.library_add_check_outlined, '追加選択', object: _ObjectAction.addSelect),
     _ToolDef(Icons.select_all, '全選択', all: true),
+    _ToolDef(Icons.auto_fix_high, 'モディファイア', object: _ObjectAction.modifiers),
   ];
 
   static const _objectTools = <_ToolDef>[
@@ -61,8 +70,12 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     _ToolDef(Icons.open_with, '移動', tool: 0),
     _ToolDef(Icons.rotate_right, '回転', tool: 1),
     _ToolDef(Icons.zoom_out_map, '拡大縮小', tool: 2),
+    _ToolDef(Icons.auto_fix_high, 'モディファイア', object: _ObjectAction.modifiers),
     _ToolDef(Icons.copy_all_outlined, '複製', object: _ObjectAction.duplicate),
     _ToolDef(Icons.delete_outline, '削除', object: _ObjectAction.delete),
+    _ToolDef(Icons.library_add_check_outlined, '追加選択', object: _ObjectAction.addSelect),
+    _ToolDef(Icons.select_all, '全選択', object: _ObjectAction.selectAll),
+    _ToolDef(Icons.workspaces_outline, 'グループ化', object: _ObjectAction.group),
   ];
 
   static const _primitives = <(IconData, String)>[
@@ -223,6 +236,30 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     );
   }
 
+  Future<void> _showExport() async {
+    // Name the file after the work.
+    var base = 'imonder';
+    final store = _store, id = _session?.id;
+    if (store != null && id != null) {
+      for (final w in await store.list()) {
+        if (w.id == id) base = w.name;
+      }
+    }
+    if (!mounted) return;
+    final saved = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: const Color(0xFF252528),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+      builder: (_) => ExportSheet(
+        viewport: _viewport,
+        baseName: base,
+        hasSelection: _hasSelectedObject(),
+        save: widget.saveExport,
+      ),
+    );
+    if (saved != null) _toast('「$saved」を書き出しました');
+  }
+
   /// Saves the visible objects as a preset.
   Future<void> _savePreset() async {
     final presets = _presets;
@@ -259,6 +296,14 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
                 const SizedBox(width: 20),
                 const Expanded(child: Text('シーン', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600))),
                 IconButton(
+                  tooltip: '書き出し（glTF / OBJ）',
+                  icon: const Icon(Icons.ios_share),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _showExport();
+                  },
+                ),
+                IconButton(
                   tooltip: 'プリセットに登録',
                   icon: const Icon(Icons.bookmark_add_outlined),
                   onPressed: () {
@@ -286,9 +331,20 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
                     itemBuilder: (_, i) {
                       final o = objects[i];
                       return ListTile(
-                        selected: o.active,
+                        selected: o.selected,
                         selectedTileColor: const Color(0xFF303034),
+                        // Checkbox: add to / take from the selection. Row: select just this one.
+                        leading: Checkbox(
+                          value: o.selected,
+                          onChanged: (_) {
+                            _viewport.toggleObject(i);
+                            setSheet(() {});
+                          },
+                        ),
                         title: Text(o.name),
+                        subtitle: o.group == 0
+                            ? null
+                            : Text('グループ ${o.group}', style: const TextStyle(fontSize: 11, color: _muted)),
                         onTap: () {
                           _viewport.selectObject(i);
                           setSheet(() {});
@@ -322,9 +378,34 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
         case _ObjectAction.add:
           _showAddSheet();
         case _ObjectAction.duplicate:
-          status & _bitHasActive != 0 ? _viewport.duplicateObject() : _toast('オブジェクトを選んでください');
+          _hasSelectedObject() ? _viewport.duplicateObject() : _toast('オブジェクトを選んでください');
         case _ObjectAction.delete:
-          status & _bitHasActive != 0 ? _viewport.deleteObject() : _toast('オブジェクトを選んでください');
+          _hasSelectedObject() ? _viewport.deleteObject() : _toast('オブジェクトを選んでください');
+        case _ObjectAction.addSelect:
+          setState(() => _viewport.addSelect = !_viewport.addSelect);
+          _toast(_viewport.addSelect ? '追加選択：タップで選択に足す／外す' : '追加選択をオフにしました');
+        case _ObjectAction.selectAll:
+          _viewport.selectAllObjects();
+        case _ObjectAction.modifiers:
+          showModalBottomSheet<void>(
+            context: context,
+            isScrollControlled: true,
+            // Keep the model visible above the sheet while adjusting.
+            barrierColor: Colors.transparent,
+            backgroundColor: const Color(0xFF252528),
+            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+            builder: (_) => ModifierSheet(viewport: _viewport),
+          );
+        case _ObjectAction.group:
+          if (status & _bitGrouped != 0) {
+            _viewport.groupObjects(false);
+            _toast('グループを解除しました');
+          } else if (status & _bitMany != 0) {
+            _viewport.groupObjects(true);
+            _toast('グループにしました（どれかをタップすると全体が選ばれます）');
+          } else {
+            _toast('2つ以上のオブジェクトを選んでください（追加選択で選べます）');
+          }
       }
     } else if (t.all) {
       _viewport.selectAll();
@@ -336,6 +417,8 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
       _toast(t.need);
     }
   }
+
+  bool _hasSelectedObject() => _viewport.objects().any((o) => o.selected);
 
   void _toggleMode(int status) {
     if (status & _bitEditMode == 0 && status & _bitHasActive == 0) {
@@ -550,17 +633,22 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
             scrollDirection: Axis.horizontal,
             child: Row(children: [
               for (final t in tools)
-                SizedBox(
-                  width: 44,
-                  height: 44,
-                  child: IconButton(
-                    tooltip: t.label,
-                    padding: EdgeInsets.zero,
-                    style: t.tool >= 0 && t.tool == _tool ? IconButton.styleFrom(backgroundColor: accent, foregroundColor: const Color(0xFF1A1A1C)) : null,
-                    onPressed: () => _useTool(t, status),
-                    icon: Icon(t.icon, size: 20, color: t.tool >= 0 && t.tool == _tool ? const Color(0xFF1A1A1C) : const Color(0xFFA9A9B0)),
-                  ),
-                ),
+                Builder(builder: (context) {
+                  final on = (t.tool >= 0 && t.tool == _tool) || (t.object == _ObjectAction.addSelect && _viewport.addSelect);
+                  final ungroup = t.object == _ObjectAction.group && status & _bitGrouped != 0;
+                  return SizedBox(
+                    width: 44,
+                    height: 44,
+                    child: IconButton(
+                      tooltip: ungroup ? 'グループ解除' : t.label,
+                      padding: EdgeInsets.zero,
+                      style: on ? IconButton.styleFrom(backgroundColor: accent, foregroundColor: const Color(0xFF1A1A1C)) : null,
+                      onPressed: () => _useTool(t, status),
+                      icon: Icon(ungroup ? Icons.workspaces_filled : t.icon,
+                          size: 20, color: on ? const Color(0xFF1A1A1C) : const Color(0xFFA9A9B0)),
+                    ),
+                  );
+                }),
             ]),
           ),
         ),
@@ -583,7 +671,7 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
   }
 }
 
-enum _ObjectAction { add, duplicate, delete }
+enum _ObjectAction { add, duplicate, delete, addSelect, selectAll, group, modifiers }
 
 class _ToolDef {
   const _ToolDef(this.icon, this.label, {this.tool = -1, this.op = -1, this.all = false, this.need = '', this.object});

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
@@ -118,6 +119,67 @@ void main() {
     expect(core.status() & 256, 0, reason: 'editing camera restored');
     core.setOrtho(true);
     expect(core.status() & 256, 256);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
+
+  test('multi-select and groups', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.addObject(4);
+    core.addObject(2);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['円柱'], reason: 'a new object is the selection');
+    expect(core.toggleObject(0), isTrue);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['立方体', '円柱']);
+    expect(core.status() & 2048, 2048);
+    expect(core.groupObjects(true), isTrue);
+    expect(core.objects().map((o) => o.group), [1, 0, 1]);
+    expect(core.selectObject(1), isTrue);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['球']);
+    expect(core.selectObject(2), isTrue);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['立方体', '円柱'], reason: 'group');
+    core.selectAllObjects();
+    expect(core.objects().every((o) => o.selected), isTrue);
+    expect(core.groupObjects(false), isTrue);
+    expect(core.objects().map((o) => o.group), [0, 0, 0]);
+    expect(core.duplicateObject(), isTrue);
+    expect(core.objects().length, 6);
+    expect(core.deleteObject(), isTrue);
+    expect(core.objects().length, 3);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
+
+  test('export: glb and obj', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.addObject(4);
+    final glb = core.exportModel(obj: false);
+    expect(String.fromCharCodes(glb.sublist(0, 4)), 'glTF');
+    final obj = String.fromCharCodes(core.exportModel(obj: true));
+    expect(obj, startsWith('# Imonder'));
+    final selected = utf8.decode(core.exportModel(obj: true, selectedOnly: true));
+    expect(selected, contains('o 球'));
+    expect(selected, isNot(contains('o 立方体')));
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
+
+  test('modifiers: add, change, apply, remove', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    expect(core.modifiers(), isEmpty);
+    expect(core.modifierAdd(1), 0);
+    expect(core.modifierAdd(0), 1);
+    expect(core.modifierAdd(7), -1);
+    var m = core.modifiers();
+    expect(m.map((x) => x.kind), ['array', 'mirror']);
+    expect((m[0].count, m[0].spacing, m[0].axis), (3, 1.0, 0));
+    expect(m[1].axes, [true, false, false]);
+    expect(core.modifierSet(0, 1, 5), isTrue);
+    expect(core.modifierSet(1, 3, 1), isTrue);
+    m = core.modifiers();
+    expect(m[0].count, 5);
+    expect(m[1].axes, [true, false, true]);
+    expect(core.modifierFinish(1, apply: false), isTrue);
+    expect(core.modifierFinish(0, apply: true), isTrue);
+    expect(core.modifiers(), isEmpty);
+    final obj = utf8.decode(core.exportModel(obj: true));
+    expect(obj.split('\n').where((l) => l.startsWith('f ')).length, 30, reason: 'five cubes baked in');
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
 }

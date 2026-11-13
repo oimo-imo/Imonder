@@ -89,7 +89,7 @@ fn face_centroid(mesh: &Mesh, f: &[u32]) -> V3 {
 }
 
 /// Drops repeated consecutive vertices and faces that collapsed.
-fn clean_faces(faces: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
+pub(crate) fn clean_faces(faces: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
     faces
         .into_iter()
         .filter_map(|f| {

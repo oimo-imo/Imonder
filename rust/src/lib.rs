@@ -1,7 +1,9 @@
 pub mod camera;
 pub mod edit;
+pub mod export;
 pub mod math;
 pub mod mesh;
+pub mod modifier;
 pub mod ops;
 pub mod render;
 pub mod scene;
@@ -109,6 +111,8 @@ pub struct Core {
     capture: Option<CaptureOpts>,
     /// Snap transforms to other objects' surfaces / the grid / angle and scale steps.
     pub snap: bool,
+    /// The modifier parameter last changed, so a slider drag becomes one undo step.
+    modifier_undo_key: Option<(usize, usize, i32)>,
     /// The editing camera, put back when capture mode ends.
     camera_before_capture: Option<Camera>,
 }
@@ -129,6 +133,7 @@ impl Core {
             rev: 0,
             capture: None,
             snap: false,
+            modifier_undo_key: None,
             camera_before_capture: None,
         }
     }
@@ -151,6 +156,7 @@ impl Core {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        self.modifier_undo_key = None;
         self.scene = s.scene;
         self.sel = s.sel;
         self.drag = None;
@@ -168,30 +174,49 @@ impl Core {
     }
 
     /// Vertices a transform acts on: the selection in edit mode, the whole active object otherwise.
-    fn transform_verts(&self) -> std::collections::BTreeSet<u32> {
+    /// What a transform moves: (object index, its vertices). The element selection of the
+    /// active object in edit mode; every selected object, whole, in object mode.
+    fn transform_targets(&self) -> Vec<(usize, std::collections::BTreeSet<u32>)> {
         if self.edit_mode {
-            self.sel.affected_verts(self.mesh())
+            if !self.scene.has_active() {
+                return Vec::new();
+            }
+            let v = self.sel.affected_verts(self.mesh());
+            if v.is_empty() {
+                return Vec::new();
+            }
+            vec![(self.scene.active, v)]
         } else {
-            (0..self.mesh().verts.len() as u32).collect()
+            self.scene
+                .selected_indices()
+                .into_iter()
+                .map(|i| (i, (0..self.scene.objects[i].mesh.verts.len() as u32).collect()))
+                .filter(|(_, v): &(usize, std::collections::BTreeSet<u32>)| !v.is_empty())
+                .collect()
+        }
+    }
+
+    /// Pivot of the targets in `scene`: the centroid of the selected elements in edit mode,
+    /// the centre of the selected objects' bounds in object mode.
+    fn pivot_in(&self, scene: &Scene, targets: &[(usize, std::collections::BTreeSet<u32>)]) -> Option<V3> {
+        if self.edit_mode {
+            let (oi, verts) = targets.first()?;
+            let mesh = &scene.objects.get(*oi)?.mesh;
+            let sum = verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(mesh.verts[i as usize]));
+            Some(sum.scale(1.0 / verts.len() as f32))
+        } else {
+            let (lo, hi) = scene.selection_bounds()?;
+            Some(lo.add(hi).scale(0.5))
         }
     }
 
     fn handle_geometry(&self) -> Option<(V3, f32, render::HandleStyle)> {
         let style = self.handle_style()?;
-        if !self.scene.has_active() {
+        let targets = self.transform_targets();
+        if targets.is_empty() {
             return None;
         }
-        let verts = self.transform_verts();
-        if verts.is_empty() {
-            return None;
-        }
-        let mesh = self.mesh();
-        let centre = if self.edit_mode {
-            let sum = verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(mesh.verts[i as usize]));
-            sum.scale(1.0 / verts.len() as f32)
-        } else {
-            self.scene.bounds_centre()?
-        };
+        let centre = self.pivot_in(&self.scene, &targets)?;
         Some((centre, self.camera.distance * 0.18, style))
     }
 
@@ -207,13 +232,14 @@ impl Core {
             active: self.scene.active,
             edit: self.edit_mode.then(|| render::EditOverlay { sel: &self.sel }),
             handles: self.handle_geometry(),
+            highlight: !self.edit_mode,
         };
         render::render_scene(&scene, &self.camera, w, h, scale, out, &render::RenderOpts::default());
     }
 
     /// The models only: no selection, handles or highlight.
     fn clean_scene(&self) -> render::Scene<'_> {
-        render::Scene { objects: &self.scene.objects, active: usize::MAX, edit: None, handles: None }
+        render::Scene { objects: &self.scene.objects, active: usize::MAX, edit: None, handles: None, highlight: false }
     }
 
     // ------------------------------------------------------------------ capture --
@@ -243,7 +269,7 @@ impl Core {
     fn visible_bounds(&self) -> Option<(V3, V3)> {
         let mut out: Option<(V3, V3)> = None;
         for o in self.scene.objects.iter().filter(|o| o.visible) {
-            if let Some((a, b)) = o.mesh.bounds() {
+            if let Some((a, b)) = o.evaluated().bounds() {
                 out = Some(match out {
                     None => (a, b),
                     Some((lo, hi)) => (
@@ -323,7 +349,7 @@ impl Core {
         let mut lo = math::v3(f32::MAX, f32::MAX, f32::MAX);
         let mut hi = math::v3(f32::MIN, f32::MIN, f32::MIN);
         for o in self.scene.objects.iter().filter(|o| o.visible) {
-            if let Some((a, b)) = o.mesh.bounds() {
+            if let Some((a, b)) = o.evaluated().bounds() {
                 lo = math::v3(lo.x.min(a.x), lo.y.min(a.y), lo.z.min(a.z));
                 hi = math::v3(hi.x.max(b.x), hi.y.max(b.y), hi.z.max(b.z));
             }
@@ -376,10 +402,19 @@ impl Core {
                 .iter()
                 .enumerate()
                 .filter(|(_, o)| o.visible)
-                .filter_map(|(i, o)| edit::pick_face(&o.mesh, &view, p).map(|(_, z)| (i, z)))
+                .filter_map(|(i, o)| edit::pick_face(&o.evaluated(), &view, p).map(|(_, z)| (i, z)))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             self.sel = Selection::new(self.sel.mode);
-            self.scene.active = hit.map_or(self.scene.objects.len(), |(i, _)| i);
+            match (hit, add) {
+                (Some((i, _)), true) => {
+                    self.scene.toggle(i);
+                }
+                (Some((i, _)), false) => {
+                    self.scene.select_only(i);
+                }
+                (None, true) => {}
+                (None, false) => self.scene.clear_selection(),
+            }
             return hit.is_some();
         }
         if self.tool == Tool::LoopCut {
@@ -415,6 +450,7 @@ impl Core {
     }
 
     fn push_undo(&mut self) {
+        self.modifier_undo_key = None;
         let s = self.snapshot();
         self.undo.push(s);
         if self.undo.len() > MAX_HISTORY {
@@ -442,7 +478,8 @@ impl Core {
 
     /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected,
     /// bit 3: an adjustable operation is active, bits 4-5: select mode (0 vertex, 1 edge, 2 face),
-    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode, bit 10: snapping.
+    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode, bit 10: snapping, bit 11: two or more objects selected,
+    /// bit 12: a selected object is in a group.
     pub fn status(&self) -> i32 {
         (!self.undo.is_empty()) as i32
             | ((!self.redo.is_empty()) as i32) << 1
@@ -458,6 +495,8 @@ impl Core {
             | (self.camera.ortho as i32) << 8
             | (self.capture.is_some() as i32) << 9
             | (self.snap as i32) << 10
+            | ((self.scene.selected_indices().len() >= 2) as i32) << 11
+            | (self.scene.objects.iter().any(|o| o.selected && o.group != 0) as i32) << 12
     }
 
     // -------------------------------------------------------------------- objects --
@@ -469,45 +508,77 @@ impl Core {
         for v in &mut mesh.verts {
             *v = v.add(self.camera.target);
         }
-        self.scene.add(name, mesh);
+        let i = self.scene.add(name, mesh);
+        self.scene.select_only(i);
         self.sel = Selection::new(self.sel.mode);
         self.edit_mode = false;
         self.last_op = None;
         true
     }
 
+    /// Copies every selected object in place; the copies become the selection.
     pub fn duplicate_object(&mut self) -> bool {
-        if !self.scene.has_active() {
+        if self.scene.selected_indices().is_empty() {
             return false;
         }
         self.push_undo();
         self.sel = Selection::new(self.sel.mode);
+        self.edit_mode = false;
         self.last_op = None;
-        self.scene.duplicate_active()
+        self.scene.duplicate_selected()
     }
 
+    /// Deletes every selected object.
     pub fn delete_object(&mut self) -> bool {
-        if !self.scene.has_active() {
+        if self.scene.selected_indices().is_empty() {
             return false;
         }
         self.push_undo();
         self.edit_mode = false;
         self.sel = Selection::new(self.sel.mode);
         self.last_op = None;
-        self.scene.remove_active();
-        true
+        self.scene.remove_selected()
     }
 
+    /// Selects only this object (and its group), e.g. from the scene list.
     pub fn select_object(&mut self, index: usize) -> bool {
         if index >= self.scene.objects.len() {
             return false;
         }
         if self.scene.active != index {
-            self.scene.active = index;
             self.sel = Selection::new(self.sel.mode);
             self.edit_mode = false;
             self.last_op = None;
         }
+        self.scene.select_only(index)
+    }
+
+    /// Adds the object (and its group) to the selection or takes it out.
+    pub fn toggle_object(&mut self, index: usize) -> bool {
+        if index >= self.scene.objects.len() {
+            return false;
+        }
+        self.sel = Selection::new(self.sel.mode);
+        self.edit_mode = false;
+        self.last_op = None;
+        self.scene.toggle(index)
+    }
+
+    pub fn select_all_objects(&mut self) {
+        self.edit_mode = false;
+        self.last_op = None;
+        self.scene.select_all_visible();
+    }
+
+    /// Groups (`on`) or ungroups the selected objects. One undo step.
+    pub fn group_objects(&mut self, on: bool) -> bool {
+        let mut probe = self.scene.clone();
+        let changed = if on { probe.group_selected() } else { probe.ungroup_selected() };
+        if !changed {
+            return false;
+        }
+        self.push_undo();
+        self.scene = probe;
         true
     }
 
@@ -674,19 +745,17 @@ impl Core {
     /// Sets the moving vertices to their starting positions transformed by the drag so far
     /// (snapped when snapping is on).
     fn apply_transform(&mut self, drag: Drag) {
-        let Some(base) = self.undo.last().map(|s| s.scene.mesh().clone()) else { return };
-        let verts = self.transform_verts();
-        if verts.is_empty() || base.verts.len() != self.mesh().verts.len() {
+        let Some(base) = self.undo.last().map(|s| s.scene.clone()) else { return };
+        let targets = self.transform_targets();
+        if targets.is_empty()
+            || targets.iter().any(|(oi, _)| base.objects.get(*oi).map(|o| o.mesh.verts.len()) != self.scene.objects.get(*oi).map(|o| o.mesh.verts.len()))
+        {
             return;
         }
-        let pivot = if self.edit_mode {
-            verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(base.verts[i as usize])).scale(1.0 / verts.len() as f32)
-        } else {
-            base.bounds().map_or(math::v3(0.0, 0.0, 0.0), |(lo, hi)| lo.add(hi).scale(0.5))
-        };
+        let Some(pivot) = self.pivot_in(&base, &targets) else { return };
         let apply: Box<dyn Fn(V3) -> V3> = match drag {
             Drag::Move { axis, free } => {
-                let t = if self.snap { self.snapped_move(&base, &verts, axis, free) } else { free };
+                let t = if self.snap { self.snapped_move(&base, &targets, axis, free) } else { free };
                 let dir = edit::axis_vec(axis);
                 Box::new(move |v| v.add(dir.scale(t)))
             }
@@ -708,32 +777,50 @@ impl Core {
                 Box::new(move |v| edit::rotate_about(v, pivot, k, a))
             }
         };
-        if let Some(mesh) = self.scene.mesh_mut() {
-            for &vi in &verts {
-                mesh.verts[vi as usize] = apply(base.verts[vi as usize]);
+        for (oi, verts) in &targets {
+            let from = &base.objects[*oi];
+            let to = &mut self.scene.objects[*oi];
+            for &vi in verts {
+                to.mesh.verts[vi as usize] = apply(from.mesh.verts[vi as usize]);
+            }
+            if !self.edit_mode {
+                to.origin = apply(from.origin); // the pivot travels with the object
             }
         }
         self.rev += 1;
     }
 
-    /// The translation to apply for a move dragged `free` along `axis`, snapped to other
-    /// visible objects' surfaces or the grid.
-    fn snapped_move(&self, base: &Mesh, verts: &std::collections::BTreeSet<u32>, axis: usize, free: f32) -> f32 {
-        let moved: Vec<V3> = verts.iter().map(|&i| base.verts[i as usize]).collect();
-        let moved_faces: Vec<Vec<V3>> = base
-            .faces
-            .iter()
-            .filter(|f| f.iter().all(|i| verts.contains(i)))
-            .map(|f| f.iter().map(|&i| base.verts[i as usize]).collect())
-            .collect();
-        let others: Vec<&Mesh> = self
-            .scene
+    /// The translation to apply for a move dragged `free` along `axis`, snapped to the
+    /// surfaces of the visible objects that are not moving, or to the grid.
+    fn snapped_move(&self, base: &Scene, targets: &[(usize, std::collections::BTreeSet<u32>)], axis: usize, free: f32) -> f32 {
+        let mut moved: Vec<V3> = Vec::new();
+        let mut moved_faces: Vec<Vec<V3>> = Vec::new();
+        for (oi, verts) in targets {
+            if self.edit_mode {
+                let mesh = &base.objects[*oi].mesh;
+                moved.extend(verts.iter().map(|&i| mesh.verts[i as usize]));
+                moved_faces.extend(
+                    mesh.faces
+                        .iter()
+                        .filter(|f| f.iter().all(|i| verts.contains(i)))
+                        .map(|f| f.iter().map(|&i| mesh.verts[i as usize]).collect()),
+                );
+            } else {
+                // Whole objects move, modifier results included.
+                let mesh = base.objects[*oi].evaluated();
+                moved.extend(mesh.verts.iter().copied());
+                moved_faces.extend(mesh.faces.iter().map(|f| f.iter().map(|&i| mesh.verts[i as usize]).collect()));
+            }
+        }
+        let moving: std::collections::BTreeSet<usize> = targets.iter().map(|(i, _)| *i).collect();
+        let others: Vec<std::borrow::Cow<'_, Mesh>> = base
             .objects
             .iter()
             .enumerate()
-            .filter(|(i, o)| *i != self.scene.active && o.visible)
-            .map(|(_, o)| &o.mesh)
+            .filter(|(i, o)| !moving.contains(i) && o.visible)
+            .map(|(_, o)| o.evaluated())
             .collect();
+        let others: Vec<&Mesh> = others.iter().map(|m| &**m).collect();
         let d = self.camera.distance;
         snap::snap_move(&moved, &moved_faces, &others, axis, free, d * 0.04, snap::grid_step(d))
     }
@@ -742,11 +829,108 @@ impl Core {
         self.snap = on;
     }
 
+    // ---------------------------------------------------------------- modifiers --
+
+    /// The active object's modifier stack as JSON.
+    pub fn modifiers_json(&self) -> String {
+        let items: Vec<String> = self
+            .scene
+            .objects
+            .get(self.scene.active)
+            .map_or(Vec::new(), |o| o.modifiers.iter().map(|m| m.to_json()).collect());
+        format!("[{}]", items.join(","))
+    }
+
+    /// Adds a modifier (0 mirror, 1 array) to the active object. Returns its index.
+    pub fn modifier_add(&mut self, kind: i32) -> Option<usize> {
+        let m = modifier::Modifier::new(kind)?;
+        if !self.scene.has_active() {
+            return None;
+        }
+        self.push_undo();
+        let o = &mut self.scene.objects[self.scene.active];
+        o.modifiers.push(m);
+        Some(o.modifiers.len() - 1)
+    }
+
+    /// Changes one parameter. Repeated changes of the same parameter (a slider being dragged)
+    /// make a single undo step.
+    pub fn modifier_set(&mut self, index: usize, param: i32, value: f32) -> bool {
+        let active = self.scene.active;
+        let mut probe = match self.scene.objects.get(active).and_then(|o| o.modifiers.get(index)) {
+            Some(m) => m.clone(),
+            None => return false,
+        };
+        if !probe.set(param, value) {
+            return false;
+        }
+        let key = (active, index, param);
+        if self.modifier_undo_key != Some(key) {
+            self.push_undo();
+            self.modifier_undo_key = Some(key);
+        }
+        self.scene.objects[active].modifiers[index] = probe;
+        self.rev += 1;
+        true
+    }
+
+    pub fn modifier_remove(&mut self, index: usize) -> bool {
+        if self.scene.objects.get(self.scene.active).map_or(true, |o| index >= o.modifiers.len()) {
+            return false;
+        }
+        self.push_undo();
+        self.scene.objects[self.scene.active].modifiers.remove(index);
+        true
+    }
+
+    /// Bakes the modifiers up to and including `index` into the mesh and removes them.
+    pub fn modifier_apply(&mut self, index: usize) -> bool {
+        let active = self.scene.active;
+        let Some(o) = self.scene.objects.get(active) else { return false };
+        if index >= o.modifiers.len() {
+            return false;
+        }
+        let baked = modifier::apply_all(&o.mesh, o.origin, &o.modifiers[..=index]);
+        self.push_undo();
+        let o = &mut self.scene.objects[active];
+        o.mesh = baked;
+        o.modifiers.drain(..=index);
+        self.sel = Selection::new(self.sel.mode);
+        self.last_op = None;
+        true
+    }
+
+    // ------------------------------------------------------------------- export --
+
+    /// Visible objects (only the selected ones if `selected_only`) as `.glb` (format 0) or
+    /// `.obj` (format 1).
+    pub fn export(&self, format: i32, selected_only: bool) -> Vec<u8> {
+        let baked: Vec<scene::Object> = self
+            .scene
+            .objects
+            .iter()
+            .filter(|o| o.visible && (!selected_only || o.selected))
+            .map(|o| scene::Object::new(o.name.clone(), o.evaluated().into_owned()))
+            .collect();
+        let objects: Vec<&scene::Object> = baked.iter().collect();
+        if format == 1 {
+            export::to_obj(&objects).into_bytes()
+        } else {
+            export::to_glb(&objects)
+        }
+    }
+
     // ------------------------------------------------------------------ presets --
 
     /// The visible objects as a work file (for saving a preset).
     pub fn visible_to_bytes(&self) -> Vec<u8> {
-        let objects = self.scene.objects.iter().filter(|o| o.visible).cloned().collect();
+        let objects = self
+            .scene
+            .objects
+            .iter()
+            .filter(|o| o.visible)
+            .map(|o| scene::Object { selected: false, group: 0, ..o.clone() })
+            .collect();
         Scene { objects, active: 0 }.to_bytes(&self.camera)
     }
 
@@ -757,10 +941,14 @@ impl Core {
             return false;
         }
         self.push_undo();
+        self.scene.clear_selection();
         for o in incoming.objects {
             let i = self.scene.add(&o.name, o.mesh);
-            self.scene.objects[i].visible = o.visible;
+            let new = &mut self.scene.objects[i];
+            (new.visible, new.selected, new.origin, new.modifiers) = (o.visible, true, o.origin, o.modifiers);
         }
+        // The pieces of a preset move together.
+        self.scene.group_selected();
         self.sel = Selection::new(self.sel.mode);
         self.edit_mode = false;
         self.last_op = None;
@@ -1264,6 +1452,87 @@ pub unsafe extern "C" fn imonder_insert(core: *mut Core, data: *const u8, len: u
     c.insert(std::slice::from_raw_parts(data, len as usize)) as i32
 }
 
+/// Adds the object (and its group) to the selection, or takes it out.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_toggle_object(core: *mut Core, index: i32) -> i32 {
+    core.as_mut().map_or(0, |c| (index >= 0 && c.toggle_object(index as usize)) as i32)
+}
+
+/// Selects every visible object.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_select_all_objects(core: *mut Core) {
+    if let Some(c) = core.as_mut() {
+        c.select_all_objects();
+    }
+}
+
+/// Groups (1) or ungroups (0) the selected objects. Returns 1 if anything changed.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_group_objects(core: *mut Core, on: i32) -> i32 {
+    core.as_mut().map_or(0, |c| c.group_objects(on != 0) as i32)
+}
+
+/// Exports the visible objects (or only the selected ones) as glTF binary (0) or OBJ (1).
+/// Free with `imonder_free_bytes`.
+///
+/// # Safety
+/// `core` must be live and `out_len` a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_export(core: *const Core, format: i32, selected_only: i32, out_len: *mut u32) -> *mut u8 {
+    let bytes = core.as_ref().map_or_else(Vec::new, |c| c.export(format, selected_only != 0));
+    leak_bytes(bytes, out_len)
+}
+
+/// The active object's modifier stack as UTF-8 JSON. Free with `imonder_free_bytes`.
+///
+/// # Safety
+/// `core` must be live and `out_len` a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifiers_json(core: *const Core, out_len: *mut u32) -> *mut u8 {
+    let json = core.as_ref().map_or_else(|| "[]".to_string(), |c| c.modifiers_json());
+    leak_bytes(json.into_bytes(), out_len)
+}
+
+/// Adds a modifier (0 mirror, 1 array) to the active object. Returns its index or -1.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifier_add(core: *mut Core, kind: i32) -> i32 {
+    core.as_mut().and_then(|c| c.modifier_add(kind)).map_or(-1, |i| i as i32)
+}
+
+/// Sets a modifier parameter (see `Modifier::set`). Returns 1 on success.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifier_set(core: *mut Core, index: i32, param: i32, value: f32) -> i32 {
+    core.as_mut().map_or(0, |c| (index >= 0 && c.modifier_set(index as usize, param, value)) as i32)
+}
+
+/// Removes (`apply` = 0) or applies (`apply` = 1) the modifier at `index`.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifier_finish(core: *mut Core, index: i32, apply: i32) -> i32 {
+    let Some(c) = core.as_mut() else { return 0 };
+    if index < 0 {
+        return 0;
+    }
+    (if apply != 0 { c.modifier_apply(index as usize) } else { c.modifier_remove(index as usize) }) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,7 +1826,7 @@ mod tests {
     fn object_mode_transform_moves_only_the_active_object() {
         let mut c = object_core();
         c.add_object(4);
-        c.scene.active = 0;
+        c.select_object(0);
         let before: Vec<_> = c.scene.objects.iter().map(|o| o.mesh.verts.clone()).collect();
         let view = c.view();
         let (centre, len, _) = c.handle_geometry().unwrap();
@@ -1581,6 +1850,8 @@ mod tests {
         assert!(!c.scene.objects[1].visible);
         assert!(c.delete_object());
         assert_eq!(c.scene.objects.len(), 1);
+        assert!(!c.delete_object(), "nothing is selected after deleting");
+        c.select_object(0);
         assert!(c.delete_object() && !c.delete_object());
         assert!(!c.scene.has_active());
         c.set_edit_mode(true);
@@ -1900,6 +2171,238 @@ mod tests {
         assert_eq!(d.scene.objects.len(), 1);
         assert!(!d.insert(b"junk"));
         assert_eq!(d.status() & 2, 2, "a failed insert records nothing (redo still there)");
+    }
+
+    /// Cube at the origin, a sphere to its right and a cone further right, front view.
+    fn three_objects() -> Core {
+        let mut c = object_core();
+        c.camera.distance = 14.0;
+        for (kind, dx) in [(4, 3.0), (3, 6.0)] {
+            c.add_object(kind);
+            for v in &mut c.scene.mesh_mut().unwrap().verts {
+                v.x += dx;
+            }
+        }
+        c.camera.target = math::v3(3.0, 0.0, 0.0);
+        let mut buf = vec![0u8; 400 * 300 * 4];
+        c.render(400, 300, 1.0, &mut buf);
+        c
+    }
+
+    fn tap_object(c: &mut Core, i: usize, add: bool) -> bool {
+        let view = c.view();
+        let (lo, hi) = c.scene.objects[i].mesh.bounds().unwrap();
+        let p = view.project(lo.add(hi).scale(0.5)).unwrap();
+        c.tap(p.0 / view.aspect, p.1, add)
+    }
+
+    #[test]
+    fn add_select_by_tap_then_move_all_selected_together() {
+        let mut c = three_objects();
+        assert!(tap_object(&mut c, 0, false));
+        assert!(tap_object(&mut c, 2, true));
+        assert_eq!(c.scene.selected_indices(), vec![0, 2]);
+        assert_eq!(c.status() & 2048, 2048, "two or more selected");
+        let before: Vec<_> = c.scene.objects.iter().map(|o| o.mesh.verts.clone()).collect();
+        c.begin_transform(Drag::Move { axis: 2, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 2, free: 1.5 });
+        c.drag_end();
+        for i in [0, 2] {
+            assert!(c.scene.objects[i].mesh.verts.iter().zip(&before[i]).all(|(a, b)| (a.z - b.z - 1.5).abs() < 1e-5));
+        }
+        assert_eq!(c.scene.objects[1].mesh.verts, before[1], "the unselected sphere stays");
+        // Tapping a selected object with "add" takes it out again.
+        assert!(tap_object(&mut c, 2, true));
+        assert_eq!(c.scene.selected_indices(), vec![0]);
+        // Tapping empty space with "add" keeps the selection; without it clears it.
+        assert!(!c.tap(0.01, 0.01, true));
+        assert_eq!(c.scene.selected_indices(), vec![0]);
+        assert!(!c.tap(0.01, 0.01, false));
+        assert!(c.scene.selected_indices().is_empty());
+    }
+
+    #[test]
+    fn rotation_of_a_selection_turns_around_its_common_centre() {
+        let mut c = three_objects();
+        c.select_all_objects();
+        let (lo, hi) = c.scene.selection_bounds().unwrap();
+        let centre = lo.add(hi).scale(0.5);
+        c.begin_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: 0.0 });
+        c.apply_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: std::f32::consts::PI });
+        let (lo2, hi2) = c.scene.selection_bounds().unwrap();
+        assert!(lo2.add(hi2).scale(0.5).sub(centre).len() < 1e-3, "half a turn keeps the centre");
+        let (sl, sh) = c.scene.objects[1].mesh.bounds().unwrap(); // the sphere in the middle stays in the middle
+        assert!((sl.add(sh).scale(0.5).x - centre.x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn groups_select_as_one_and_duplicate_and_delete_together() {
+        let mut c = three_objects();
+        c.select_object(0);
+        c.toggle_object(1);
+        assert!(c.group_objects(true));
+        assert_eq!(c.status() & 4096, 4096);
+        assert!(tap_object(&mut c, 2, false));
+        assert!(tap_object(&mut c, 1, false));
+        assert_eq!(c.scene.selected_indices(), vec![0, 1], "one tap selects the whole group");
+        assert!(c.duplicate_object());
+        assert_eq!(c.scene.objects.len(), 5);
+        assert_eq!(c.scene.selected_indices(), vec![3, 4]);
+        assert!(c.delete_object());
+        assert_eq!(c.scene.objects.len(), 3);
+        assert!(c.undo() && c.undo());
+        assert_eq!(c.scene.objects.len(), 3);
+        assert!(c.scene.objects.iter().all(|o| o.group == 1 || o.name == "円錐"), "back to grouped");
+        c.select_object(0);
+        assert!(c.group_objects(false));
+        c.select_object(0);
+        assert_eq!(c.scene.selected_indices(), vec![0]);
+        assert!(!c.group_objects(false), "nothing to ungroup");
+    }
+
+    #[test]
+    fn an_inserted_preset_arrives_selected_as_one_group() {
+        let src = three_objects();
+        let preset = src.visible_to_bytes();
+        let mut c = object_core();
+        assert!(c.insert(&preset));
+        assert_eq!(c.scene.selected_indices(), vec![1, 2, 3]);
+        let g = c.scene.objects[1].group;
+        assert!(g != 0 && c.scene.objects[1..].iter().all(|o| o.group == g));
+        assert_eq!(c.scene.objects[0].group, 0);
+    }
+
+    #[test]
+    fn selection_and_groups_survive_saving() {
+        let mut c = three_objects();
+        c.select_object(0);
+        c.toggle_object(2);
+        c.group_objects(true);
+        let mut d = Core::new();
+        assert!(d.load(&c.to_bytes()));
+        assert_eq!(d.scene.selected_indices(), vec![0, 2]);
+        assert_eq!(d.scene.objects.iter().map(|o| o.group).collect::<Vec<_>>(), vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn export_respects_visibility_and_selection() {
+        let mut c = three_objects();
+        c.set_visible(1, false);
+        c.select_object(2);
+        let all = String::from_utf8(c.export(1, false)).unwrap();
+        assert!(all.contains("o 立方体") && !all.contains("o 球") && all.contains("o 円錐"));
+        let sel = String::from_utf8(c.export(1, true)).unwrap();
+        assert!(!sel.contains("o 立方体") && sel.contains("o 円錐"));
+        assert_eq!(&c.export(0, false)[0..4], b"glTF");
+    }
+
+    #[test]
+    fn outlines_get_thinner_when_the_camera_is_far() {
+        assert_eq!(render::edge_width_factor(5.0), 1.0, "close up: unchanged");
+        assert_eq!(render::edge_width_factor(7.0), 1.0);
+        assert!((render::edge_width_factor(28.0) - 0.5).abs() < 1e-6);
+        assert_eq!(render::edge_width_factor(500.0), 0.4, "never vanishes");
+        // In a picture: the dark outline pixels per unit of edge length drop when far away.
+        let ink = |distance: f32| {
+            let mut c = object_core();
+            c.set_capture(Some(CaptureOpts { grid: false, edges: true }));
+            c.camera.distance = distance;
+            let (w, h) = (600usize, 600usize);
+            let mut buf = vec![0u8; w * h * 4];
+            c.render(w, h, 1.0, &mut buf);
+            let view = c.view();
+            let mesh = c.mesh();
+            let edge_px: f32 = edit::edge_faces(mesh)
+                .keys()
+                .filter_map(|&(a, b)| {
+                    let p = view.project(mesh.verts[a as usize])?;
+                    let q = view.project(mesh.verts[b as usize])?;
+                    Some(((p.0 - q.0) / view.aspect * w as f32).hypot((p.1 - q.1) * h as f32))
+                })
+                .sum();
+            // Outline ink: pixels darker than the clay faces (>100) but not the backdrop (~30).
+            let dark: f32 = buf.chunks(4).filter(|p| p[0] > 36 && p[0] < 100).map(|p| (100 - p[0]) as f32).sum();
+            dark / edge_px
+        };
+        let (near, far) = (ink(7.0), ink(40.0));
+        assert!(far < near * 0.75, "far {far} vs near {near}");
+    }
+
+    #[test]
+    fn mirror_follows_the_object_and_shows_everywhere() {
+        let mut c = object_core();
+        // Model the +X half of a box sitting right of the origin.
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x = v.x * 0.5 + 0.5; // x: 0..1
+        }
+        c.scene.objects[0].origin = math::v3(0.0, 0.0, 0.0);
+        assert_eq!(c.modifier_add(modifier::KIND_MIRROR), Some(0));
+        let (lo, hi) = c.scene.objects[0].evaluated().bounds().unwrap();
+        assert_eq!((lo.x, hi.x), (-1.0, 1.0));
+        // Moving the object moves the origin, so the mirror travels along.
+        c.select_object(0);
+        c.begin_transform(Drag::Move { axis: 0, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 0, free: 3.0 });
+        c.drag_end();
+        assert_eq!(c.scene.objects[0].origin.x, 3.0);
+        let (lo, hi) = c.scene.objects[0].evaluated().bounds().unwrap();
+        assert_eq!((lo.x, hi.x), (2.0, 4.0));
+        // Editing vertices does not move the origin.
+        c.set_edit_mode(true);
+        c.select_all();
+        c.begin_transform(Drag::Move { axis: 0, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 0, free: 0.5 });
+        c.drag_end();
+        assert_eq!(c.scene.objects[0].origin.x, 3.0);
+        c.set_edit_mode(false);
+        // The export and the object's bounds include the mirrored half.
+        let obj = String::from_utf8(c.export(1, false)).unwrap();
+        assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), 16, "two separate halves after the edit");
+        assert_eq!(c.scene.selection_bounds().unwrap().0.x, 1.5);
+    }
+
+    #[test]
+    fn modifier_sliders_make_one_undo_step_and_apply_bakes() {
+        let mut c = object_core();
+        let i = c.modifier_add(modifier::KIND_ARRAY).unwrap();
+        let steps = c.undo.len();
+        for v in [1.1, 1.2, 1.3, 1.5] {
+            assert!(c.modifier_set(i, 2, v));
+        }
+        assert_eq!(c.undo.len(), steps + 1, "dragging the spacing slider is one step");
+        assert!(c.modifier_set(i, 1, 5.0));
+        assert_eq!(c.undo.len(), steps + 2, "another parameter is another step");
+        assert!(c.modifiers_json().contains("\"count\":5"));
+        assert!(c.undo());
+        assert!(c.modifiers_json().contains("\"count\":3") && c.modifiers_json().contains("\"spacing\":1.5"));
+        assert!(c.modifier_apply(i));
+        assert_eq!(c.mesh().faces.len(), 18, "three cubes baked in");
+        assert_eq!(c.modifiers_json(), "[]");
+        assert!(!c.modifier_set(0, 1, 2.0));
+        assert!(c.undo());
+        assert_eq!(c.mesh().faces.len(), 6);
+        assert!(c.modifier_remove(0));
+        assert_eq!(c.modifiers_json(), "[]");
+    }
+
+    #[test]
+    fn picking_hits_mirrored_geometry_and_duplicates_keep_modifiers() {
+        let mut c = object_core();
+        c.camera.distance = 12.0;
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x = v.x * 0.5 + 3.5; // a small box at x 3..4
+        }
+        c.scene.objects[0].origin = math::v3(0.0, 0.0, 0.0);
+        c.modifier_add(modifier::KIND_MIRROR); // its mirror image sits at x -4..-3
+        c.scene.clear_selection();
+        let mut buf = vec![0u8; 400 * 300 * 4];
+        c.render(400, 300, 1.0, &mut buf);
+        let view = c.view();
+        let p = view.project(math::v3(-3.5, 0.0, 0.0)).unwrap();
+        assert!(c.tap(p.0 / view.aspect, p.1, false), "tapping the mirrored half selects the object");
+        assert!(c.duplicate_object());
+        assert_eq!(c.scene.objects[1].modifiers.len(), 1);
+        assert_eq!(c.scene.objects[1].origin, c.scene.objects[0].origin);
     }
 
     #[test]

@@ -27,15 +27,47 @@ typedef _Revision = int Function(Pointer<Void>);
 typedef _Thumb = int Function(Pointer<Void>, int, int, Pointer<Uint8>);
 typedef _Capture = void Function(Pointer<Void>, int, int, int);
 typedef _Preset = int Function(Pointer<Void>, int, double, double, double, double, double);
+typedef _Export2 = Pointer<Uint8> Function(Pointer<Void>, int, int, Pointer<Uint32>);
+typedef _ModSet = int Function(Pointer<Void>, int, int, double);
+typedef _ModFinish = int Function(Pointer<Void>, int, int);
 typedef _FrameAll = void Function(Pointer<Void>, double, double, double, double, double);
 typedef _Export = int Function(Pointer<Void>, int, int, double, double, double, double, double, double, int, Pointer<Uint8>);
 
+/// One modifier of the active object's stack.
+class ModifierInfo {
+  ModifierInfo.fromJson(Map<String, dynamic> j)
+      : kind = j['kind'] as String,
+        enabled = j['enabled'] as bool,
+        merge = j['merge'] as bool,
+        axes = j['kind'] == 'mirror' ? (j['axes'] as List).cast<bool>() : const [false, false, false],
+        count = (j['count'] as num?)?.toInt() ?? 0,
+        spacing = (j['spacing'] as num?)?.toDouble() ?? 0,
+        axis = (j['axis'] as num?)?.toInt() ?? 0;
+
+  /// 'mirror' or 'array'.
+  final String kind;
+  final bool enabled;
+  final bool merge;
+
+  /// Mirror: which axes reflect.
+  final List<bool> axes;
+
+  /// Array: copies, spacing (1 = touching), direction axis.
+  final int count;
+  final double spacing;
+  final int axis;
+}
+
 /// One entry of the scene list.
 class SceneObject {
-  const SceneObject(this.name, this.visible, this.active);
+  const SceneObject(this.name, this.visible, this.active, {this.selected = false, this.group = 0});
   final String name;
   final bool visible;
   final bool active;
+  final bool selected;
+
+  /// Objects with the same non-zero group are selected together.
+  final int group;
 }
 typedef _Render = int Function(Pointer<Void>, int, int, double, Pointer<Uint8>);
 
@@ -99,6 +131,14 @@ class NativeCore {
     _setSnap = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_snap');
     _visibleBytes = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_visible_bytes');
     _insert = l.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint8>, Uint32), _Load>('imonder_insert');
+    _toggleObject = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_toggle_object');
+    _selectAllObjects = l.lookupFunction<Void Function(Pointer<Void>), _Void>('imonder_select_all_objects');
+    _groupObjects = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_group_objects');
+    _exportModel = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Int32, Int32, Pointer<Uint32>), _Export2>('imonder_export');
+    _modifiersJson = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_modifiers_json');
+    _modifierAdd = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_modifier_add');
+    _modifierSet = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32, Float), _ModSet>('imonder_modifier_set');
+    _modifierFinish = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32), _ModFinish>('imonder_modifier_finish');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -148,6 +188,14 @@ class NativeCore {
   late final _Flag _setSnap;
   late final _Bytes _visibleBytes;
   late final _Load _insert;
+  late final _Op _toggleObject;
+  late final _Void _selectAllObjects;
+  late final _Op _groupObjects;
+  late final _Export2 _exportModel;
+  late final _Bytes _modifiersJson;
+  late final _Op _modifierAdd;
+  late final _ModSet _modifierSet;
+  late final _ModFinish _modifierFinish;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -231,6 +279,13 @@ class NativeCore {
   bool duplicateObject() => _duplicateObject(_handle) == 1;
   bool deleteObject() => _deleteObject(_handle) == 1;
   bool selectObject(int index) => _selectObject(_handle, index) == 1;
+  /// Adds the object (and its group) to the selection, or takes it out.
+  bool toggleObject(int index) => _toggleObject(_handle, index) == 1;
+  void selectAllObjects() => _selectAllObjects(_handle);
+
+  /// Groups (true) or ungroups (false) the selected objects; false if nothing changed.
+  bool groupObjects(bool on) => _groupObjects(_handle, on ? 1 : 0) == 1;
+
   bool setVisible(int index, bool visible) => _setVisible(_handle, index, visible ? 1 : 0) == 1;
 
   Uint8List _takeBytes(Pointer<Uint8> p, Pointer<Uint32> len) {
@@ -245,7 +300,11 @@ class NativeCore {
     try {
       final bytes = _takeBytes(_sceneJson(_handle, len), len);
       final list = jsonDecode(utf8.decode(bytes)) as List<dynamic>;
-      return [for (final o in list) SceneObject(o['name'] as String, o['visible'] as bool, o['active'] as bool)];
+      return [
+        for (final o in list)
+          SceneObject(o['name'] as String, o['visible'] as bool, o['active'] as bool,
+              selected: o['selected'] as bool, group: o['group'] as int),
+      ];
     } finally {
       malloc.free(len);
     }
@@ -258,6 +317,37 @@ class NativeCore {
     final len = malloc<Uint32>();
     try {
       return _takeBytes(_save(_handle, len), len);
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  // ---------------------------------------------------------------- modifiers --
+
+  List<ModifierInfo> modifiers() {
+    final len = malloc<Uint32>();
+    try {
+      final list = jsonDecode(utf8.decode(_takeBytes(_modifiersJson(_handle, len), len))) as List<dynamic>;
+      return [for (final m in list) ModifierInfo.fromJson(m as Map<String, dynamic>)];
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  /// Adds a modifier to the active object (0 mirror, 1 array); its index, or -1.
+  int modifierAdd(int kind) => _modifierAdd(_handle, kind);
+
+  /// Mirror params: 0 enabled, 1-3 X/Y/Z, 4 merge. Array: 0 enabled, 1 count, 2 spacing, 3 axis, 4 merge.
+  bool modifierSet(int index, int param, double value) => _modifierSet(_handle, index, param, value) == 1;
+
+  /// Applies (bakes, together with the ones above it) or removes a modifier.
+  bool modifierFinish(int index, {required bool apply}) => _modifierFinish(_handle, index, apply ? 1 : 0) == 1;
+
+  /// The visible objects (or only the selected ones) as glTF binary ([obj] false) or OBJ text.
+  Uint8List exportModel({required bool obj, bool selectedOnly = false}) {
+    final len = malloc<Uint32>();
+    try {
+      return _takeBytes(_exportModel(_handle, obj ? 1 : 0, selectedOnly ? 1 : 0, len), len);
     } finally {
       malloc.free(len);
     }

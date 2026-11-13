@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -15,6 +16,13 @@ Future<void> settle(WidgetTester tester, {int rounds = 120}) async {
     await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
     await tester.pump(const Duration(milliseconds: 10));
   }
+}
+
+/// Taps a toolbar button, scrolling the toolbar first if the button is off screen.
+Future<void> tapTool(WidgetTester tester, String tooltip) async {
+  await tester.ensureVisible(find.byTooltip(tooltip));
+  await tester.pumpAndSettle();
+  await tester.tap(find.byTooltip(tooltip));
 }
 
 /// Runs the real UI against the real Rust library. Needs `cargo build --release` in rust/ first.
@@ -176,6 +184,128 @@ void main() {
     await tester.tap(find.text('へや'));
     await settle(tester, rounds: 60);
     expect(await sceneNames(), ['立方体', '球']);
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
+  testWidgets('multi-select from the toolbar, grouping shown in the scene list', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(const MaterialApp(home: EditorScreen()));
+    await settle(tester);
+    await tester.tap(find.byTooltip('追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('球'));
+    await settle(tester, rounds: 10);
+
+    await tapTool(tester, 'グループ化');
+    await settle(tester, rounds: 10);
+    expect(find.textContaining('2つ以上のオブジェクトを選んでください'), findsOneWidget);
+    await tapTool(tester, '全選択');
+    await settle(tester, rounds: 10);
+    await tapTool(tester, 'グループ化');
+    await settle(tester, rounds: 10);
+    expect(find.byTooltip('グループ解除'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('シーン'));
+    await tester.pumpAndSettle();
+    expect(find.text('グループ 1'), findsNWidgets(2));
+    expect(tester.widgetList<Checkbox>(find.byType(Checkbox)).every((c) => c.value == true), isTrue);
+    // Unticking one member takes the whole group out of the selection.
+    await tester.tap(find.byType(Checkbox).first);
+    await tester.pumpAndSettle();
+    expect(tester.widgetList<Checkbox>(find.byType(Checkbox)).every((c) => c.value == false), isTrue);
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+
+    // The add-select toggle lights up.
+    await tapTool(tester, '追加選択');
+    await settle(tester, rounds: 10);
+    final button = tester.widget<IconButton>(find.ancestor(of: find.byIcon(Icons.library_add_check_outlined), matching: find.byType(IconButton)));
+    expect(button.style, isNotNull, reason: 'highlighted while on');
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
+  testWidgets('export: glTF by default, OBJ of the selection, named after the work', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    final saved = <(String, Uint8List)>[];
+    await tester.pumpWidget(MaterialApp(
+      home: EditorScreen(saveExport: (name, bytes) async {
+        saved.add((name, bytes));
+        return '/somewhere/$name';
+      }),
+    ));
+    await settle(tester);
+    await tester.tap(find.byTooltip('追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('トーラス'));
+    await settle(tester, rounds: 10);
+
+    Future<void> openExport() async {
+      await tester.tap(find.byTooltip('シーン'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('書き出し（glTF / OBJ）'));
+      await settle(tester, rounds: 30);
+    }
+
+    await openExport();
+    await tester.tap(find.text('保存先を選んで書き出す'));
+    await settle(tester, rounds: 30);
+    expect(saved.last.$1, '無題.glb');
+    expect(String.fromCharCodes(saved.last.$2.sublist(0, 4)), 'glTF');
+    expect(find.textContaining('「無題.glb」を書き出しました'), findsOneWidget);
+
+    await openExport();
+    await tester.tap(find.text('OBJ (.obj)'));
+    await tester.tap(find.text('選択中だけ'));
+    await tester.pump();
+    await tester.tap(find.text('保存先を選んで書き出す'));
+    await settle(tester, rounds: 30);
+    expect(saved.last.$1, '無題.obj');
+    final text = utf8.decode(saved.last.$2);
+    expect(text, contains('o トーラス'));
+    expect(text, isNot(contains('o 立方体')), reason: 'only the selected torus');
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
+  testWidgets('modifier sheet: add an array, change it, apply it', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(const MaterialApp(home: EditorScreen()));
+    await settle(tester);
+    await tapTool(tester, 'モディファイア');
+    await tester.pumpAndSettle();
+    expect(find.textContaining('「＋」でミラーか配列を追加します'), findsOneWidget);
+    await tester.tap(find.byTooltip('モディファイアを追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('配列'));
+    await tester.pumpAndSettle();
+    expect(find.text('3'), findsOneWidget, reason: 'three copies by default');
+    await tester.tap(find.byTooltip('増やす'));
+    await tester.pump();
+    expect(find.text('4'), findsOneWidget);
+    await tester.tap(find.text('Z').last);
+    await tester.pump();
+    await tester.tap(find.byTooltip('適用（形に焼き込む）'));
+    await tester.pump();
+    expect(find.textContaining('「＋」でミラーか配列を追加します'), findsOneWidget, reason: 'baked: the stack is empty again');
+    await tester.tapAt(const Offset(10, 300));
+    await tester.pumpAndSettle();
+    // Undo brings the modifier back (applying is one undo step).
+    await tester.tap(find.byTooltip('元に戻す'));
+    await tester.pump();
+    await tapTool(tester, 'モディファイア');
+    await tester.pumpAndSettle();
+    expect(find.text('4'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox());
     await settle(tester, rounds: 30);
