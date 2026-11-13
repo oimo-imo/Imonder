@@ -2162,6 +2162,38 @@ mod tests {
     }
 
     #[test]
+    fn outlines_get_thinner_when_the_camera_is_far() {
+        assert_eq!(render::edge_width_factor(5.0), 1.0, "close up: unchanged");
+        assert_eq!(render::edge_width_factor(7.0), 1.0);
+        assert!((render::edge_width_factor(28.0) - 0.5).abs() < 1e-6);
+        assert_eq!(render::edge_width_factor(500.0), 0.4, "never vanishes");
+        // In a picture: the dark outline pixels per unit of edge length drop when far away.
+        let ink = |distance: f32| {
+            let mut c = object_core();
+            c.set_capture(Some(CaptureOpts { grid: false, edges: true }));
+            c.camera.distance = distance;
+            let (w, h) = (600usize, 600usize);
+            let mut buf = vec![0u8; w * h * 4];
+            c.render(w, h, 1.0, &mut buf);
+            let view = c.view();
+            let mesh = c.mesh();
+            let edge_px: f32 = edit::edge_faces(mesh)
+                .keys()
+                .filter_map(|&(a, b)| {
+                    let p = view.project(mesh.verts[a as usize])?;
+                    let q = view.project(mesh.verts[b as usize])?;
+                    Some(((p.0 - q.0) / view.aspect * w as f32).hypot((p.1 - q.1) * h as f32))
+                })
+                .sum();
+            // Outline ink: pixels darker than the clay faces (>100) but not the backdrop (~30).
+            let dark: f32 = buf.chunks(4).filter(|p| p[0] > 36 && p[0] < 100).map(|p| (100 - p[0]) as f32).sum();
+            dark / edge_px
+        };
+        let (near, far) = (ink(7.0), ink(40.0));
+        assert!(far < near * 0.75, "far {far} vs near {near}");
+    }
+
+    #[test]
     fn drag_without_handle_hit_does_nothing() {
         let mut c = front_core();
         c.tap(0.5, 0.5, false);

@@ -163,6 +163,8 @@ impl<'a> Frame<'a> {
         let (x1, y1, z1) = self.to_screen(b);
         let steps = ((x1 - x0).abs().max((y1 - y0).abs()).ceil() as i32).clamp(1, 8000);
         let r = (width * 0.5).max(0.5);
+        // Thinner than a pixel: draw one pixel wide but fainter, which reads as thinner.
+        let alpha = if width < 1.0 { alpha * width.max(0.0) } else { alpha };
         let ri = r.ceil() as i32;
         for s in 0..=steps {
             let t = s as f32 / steps as f32;
@@ -259,6 +261,12 @@ pub struct Scene<'a> {
     pub highlight: bool,
 }
 
+/// How much thinner outlines get as the camera pulls back: unchanged up to the default
+/// distance (7), then shrinking with the square root of the distance, down to 40%.
+pub fn edge_width_factor(distance: f32) -> f32 {
+    (7.0 / distance.max(0.01)).sqrt().clamp(0.4, 1.0)
+}
+
 const ACCENT: [f32; 3] = [242.0, 163.0, 94.0]; // #F2A35E
 const AXIS_COL: [[f32; 3]; 3] = [[229.0, 83.0, 75.0], [123.0, 200.0, 108.0], [91.0, 141.0, 239.0]];
 
@@ -275,6 +283,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
     // Outlines sit a hair in front of their faces: 0.6% of the viewing distance, so they never
     // poke through an object that is only slightly in front of them.
     let line_bias = cam.depth_bias(cam.distance * 0.006);
+    let thin = edge_width_factor(cam.distance);
 
     // Ground grid (XY plane) + axes.
     if opts.grid {
@@ -353,9 +362,9 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
             let b = clip(&vp, mesh.verts[face[(k + 1) % face.len()] as usize]);
             if outlined {
                 // The active object a little bolder than the rest of the selection.
-                f.line(a, b, ACCENT, 1.0, if is_active { 2.4 } else { 1.7 } * scale, line_bias * 1.5);
+                f.line(a, b, ACCENT, 1.0, if is_active { 2.4 } else { 1.7 } * scale * thin.max(0.6), line_bias * 1.5);
             } else if opts.edges {
-                f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, line_bias);
+                f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale * thin, line_bias);
             }
         }
     }
