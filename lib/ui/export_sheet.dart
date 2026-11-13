@@ -10,7 +10,7 @@ import 'viewport.dart';
 typedef SaveFile = Future<String?> Function(String fileName, Uint8List bytes);
 
 Future<String?> saveWithPicker(String fileName, Uint8List bytes) =>
-    FilePicker.saveFile(dialogTitle: '書き出し', fileName: fileName, bytes: bytes);
+    FilePicker.platform.saveFile(dialogTitle: '書き出し', fileName: fileName, bytes: bytes);
 
 /// Characters that are not allowed in file names on Windows / Android.
 String safeFileName(String name) {
