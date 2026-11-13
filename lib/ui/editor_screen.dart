@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 
 import '../storage/work_session.dart';
 import '../storage/work_store.dart';
-import '../update/update_sheet.dart';
 import '../update/updater.dart';
 import 'capture_overlay.dart';
 import 'gallery_screen.dart';
@@ -116,15 +115,6 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     }
   }
 
-  void _openSettings() {
-    showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: const Color(0xFF252528),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
-      builder: (_) => const UpdateSheet(),
-    );
-  }
-
   void _toast(String text) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
@@ -139,7 +129,9 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     await session.flush();
     if (!mounted) return;
     final choice = await Navigator.of(context).push<GalleryChoice>(
-      MaterialPageRoute(builder: (_) => GalleryScreen(store: store, currentId: session.id)),
+      MaterialPageRoute(
+        builder: (_) => GalleryScreen(store: store, currentId: session.id, updateAvailable: _pendingUpdate != null),
+      ),
     );
     switch (choice) {
       case OpenWork(:final id):
@@ -408,10 +400,9 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
       padding: EdgeInsets.fromLTRB(6, MediaQuery.paddingOf(context).top, 6, 0),
       height: 52 + MediaQuery.paddingOf(context).top,
       child: Row(children: [
-        _iconBtn(Icons.grid_view, 'ギャラリー', _session == null ? null : _openGallery),
+        _iconBtn(Icons.grid_view, _pendingUpdate != null ? 'ギャラリー（アップデートがあります）' : 'ギャラリー',
+            _session == null ? null : _openGallery, dot: _pendingUpdate != null),
         _iconBtn(Icons.photo_camera_outlined, '撮影', () => setState(() => _capturing = true), color: const Color(0xFFD4D4D9)),
-        _iconBtn(Icons.system_update_alt, 'アップデート', _openSettings,
-            color: _pendingUpdate != null ? accent : _muted, dot: _pendingUpdate != null),
         const Spacer(),
         _iconBtn(Icons.layers_outlined, 'シーン', _showOutliner, color: _muted),
         _iconBtn(Icons.hub_outlined, editMode ? '編集モード' : 'オブジェクトモード', () => _toggleMode(status), color: editMode ? accent : _muted),

@@ -79,6 +79,26 @@ impl Camera {
         M4::look_at(self.view_eye(), self.target, v3(0.0, 0.0, 1.0))
     }
 
+    /// How much NDC depth `world` units of distance amount to at the target, so outlines can be
+    /// pulled just in front of their own faces without showing through other objects.
+    pub fn depth_bias(&self, world: f32) -> f32 {
+        let (near, far) = self.clip_planes();
+        if self.ortho {
+            world * 2.0 / (far - near)
+        } else {
+            let d = self.distance.max(near);
+            world * 2.0 * far * near / ((far - near) * d * d)
+        }
+    }
+
+    fn clip_planes(&self) -> (f32, f32) {
+        if self.ortho {
+            (0.05, ORTHO_BACK * 2.5)
+        } else {
+            (0.05, 500.0)
+        }
+    }
+
     /// Half width and half height of the view at the target's distance.
     pub fn half_extents(&self, aspect: f32) -> (f32, f32) {
         let fovy = if aspect < 1.0 { 2.0 * ((self.fovy * 0.5).tan() / aspect).atan() } else { self.fovy };
@@ -103,9 +123,11 @@ impl Camera {
         if self.ortho {
             // Same framing as the perspective view has at the target's distance.
             let h = self.distance * (fovy * 0.5).tan();
-            M4::orthographic(h * aspect, h, 0.05, ORTHO_BACK * 2.5)
+            let (near, far) = self.clip_planes();
+            M4::orthographic(h * aspect, h, near, far)
         } else {
-            M4::perspective(fovy, aspect, 0.05, 500.0)
+            let (near, far) = self.clip_planes();
+            M4::perspective(fovy, aspect, near, far)
         }
     }
 

@@ -138,6 +138,7 @@ void main() {
     await settle(tester, rounds: 30);
     expect(find.text('ねこ'), findsOneWidget);
     expect(find.text('いぬ'), findsOneWidget);
+    expect(find.byTooltip('アップデート'), findsOneWidget, reason: 'updates live on the home screen');
     await tester.tap(find.text('ねこ'));
     await tester.pumpAndSettle();
     expect(choice, isA<OpenWork>());
