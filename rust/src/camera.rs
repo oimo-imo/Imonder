@@ -8,6 +8,8 @@ pub struct Camera {
     pub distance: f32,
     pub target: V3,
     pub fovy: f32,
+    /// Orthographic (parallel) projection. `distance` then sets the zoom instead of the position.
+    pub ortho: bool,
 }
 
 impl Default for Camera {
@@ -18,11 +20,13 @@ impl Default for Camera {
             distance: 7.0,
             target: v3(0.0, 0.0, 0.0),
             fovy: 0.8,
+            ortho: false,
         }
     }
 }
 
 const MAX_PITCH: f32 = 1.55;
+const ORTHO_BACK: f32 = 400.0;
 
 impl Camera {
     pub fn eye(&self) -> V3 {
@@ -30,6 +34,23 @@ impl Camera {
         let (sp, cp) = self.pitch.sin_cos();
         self.target
             .add(v3(cy * cp, sy * cp, sp).scale(self.distance))
+    }
+
+    /// Unit vector from the target towards the camera.
+    pub fn dir(&self) -> V3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        v3(cy * cp, sy * cp, sp)
+    }
+
+    /// Where the view is rendered from. An orthographic camera sits far back along its
+    /// direction, so zooming in never puts it inside the model.
+    pub fn view_eye(&self) -> V3 {
+        if self.ortho {
+            self.target.add(self.dir().scale(ORTHO_BACK))
+        } else {
+            self.eye()
+        }
     }
 
     pub fn orbit(&mut self, dx: f32, dy: f32) {
@@ -55,7 +76,21 @@ impl Camera {
     }
 
     pub fn view(&self) -> M4 {
-        M4::look_at(self.eye(), self.target, v3(0.0, 0.0, 1.0))
+        M4::look_at(self.view_eye(), self.target, v3(0.0, 0.0, 1.0))
+    }
+
+    /// Half width and half height of the view at the target's distance.
+    pub fn half_extents(&self, aspect: f32) -> (f32, f32) {
+        let fovy = if aspect < 1.0 { 2.0 * ((self.fovy * 0.5).tan() / aspect).atan() } else { self.fovy };
+        let hh = self.distance * (fovy * 0.5).tan();
+        (hh * aspect, hh)
+    }
+
+    /// Camera right and up vectors.
+    pub fn basis(&self) -> (V3, V3) {
+        let f = self.dir().scale(-1.0);
+        let right = f.cross(v3(0.0, 0.0, 1.0)).norm();
+        (right, right.cross(f))
     }
 
     pub fn proj(&self, aspect: f32) -> M4 {
@@ -65,7 +100,13 @@ impl Camera {
         } else {
             self.fovy
         };
-        M4::perspective(fovy, aspect, 0.05, 500.0)
+        if self.ortho {
+            // Same framing as the perspective view has at the target's distance.
+            let h = self.distance * (fovy * 0.5).tan();
+            M4::orthographic(h * aspect, h, 0.05, ORTHO_BACK * 2.5)
+        } else {
+            M4::perspective(fovy, aspect, 0.05, 500.0)
+        }
     }
 
     /// Look at the target from along a world axis.

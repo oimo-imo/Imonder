@@ -15,13 +15,41 @@ pub struct Frame<'a> {
     depth: Vec<f32>,
 }
 
+/// What to draw besides the models, and how to frame the image.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderOpts {
+    pub grid: bool,
+    /// Dark outlines on every face edge.
+    pub edges: bool,
+    /// Transparent background (alpha 0) instead of the dark backdrop.
+    pub transparent: bool,
+    /// Render only part of the view: (aspect of the full view, rect as fractions of it).
+    pub crop: Option<(f32, [f32; 4])>,
+    /// Darken the backdrop slightly toward the edges (editing only; images get a flat backdrop).
+    pub vignette: bool,
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        RenderOpts { grid: true, edges: true, transparent: false, crop: None, vignette: true }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Clip([f32; 4]);
 
 impl<'a> Frame<'a> {
-    fn new(w: usize, h: usize, rgba: &'a mut [u8]) -> Self {
+    fn new(w: usize, h: usize, rgba: &'a mut [u8], transparent: bool, vignette: bool) -> Self {
         let mut f = Frame { w, h, rgba, depth: vec![f32::INFINITY; w * h] };
-        f.clear();
+        if transparent {
+            f.rgba[..w * h * 4].fill(0);
+        } else if vignette {
+            f.clear();
+        } else {
+            for px in f.rgba[..w * h * 4].chunks_exact_mut(4) {
+                px.copy_from_slice(&[BG[0] as u8, BG[1] as u8, BG[2] as u8, 255]);
+            }
+        }
         f
     }
 
@@ -64,10 +92,24 @@ impl<'a> Frame<'a> {
             self.depth[idx] = z;
         }
         let i = idx * 4;
+        let dst_a = self.rgba[i + 3] as f32 / 255.0;
+        if dst_a >= 1.0 {
+            for c in 0..3 {
+                let dst = self.rgba[i + c] as f32;
+                self.rgba[i + c] = (dst + (col[c] - dst) * alpha) as u8;
+            }
+            return;
+        }
+        // Over a (partly) transparent background: regular "over" compositing.
+        let out_a = alpha + dst_a * (1.0 - alpha);
+        if out_a <= 0.0 {
+            return;
+        }
         for c in 0..3 {
             let dst = self.rgba[i + c] as f32;
-            self.rgba[i + c] = (dst + (col[c] - dst) * alpha) as u8;
+            self.rgba[i + c] = ((col[c] * alpha + dst * dst_a * (1.0 - alpha)) / out_a).round().min(255.0) as u8;
         }
+        self.rgba[i + 3] = (out_a * 255.0).round() as u8;
     }
 
     fn triangle(&mut self, a: Clip, b: Clip, c: Clip, col: [f32; 3]) {
@@ -184,31 +226,35 @@ const ACCENT: [f32; 3] = [242.0, 163.0, 94.0]; // #F2A35E
 const AXIS_COL: [[f32; 3]; 3] = [[229.0, 83.0, 75.0], [123.0, 200.0, 108.0], [91.0, 141.0, 239.0]];
 
 /// Renders into `rgba` (w*h*4, tightly packed). `scale` = device pixel ratio (line widths).
-pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32, rgba: &mut [u8]) {
+pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32, rgba: &mut [u8], opts: &RenderOpts) {
     assert!(rgba.len() >= w * h * 4);
-    let mut f = Frame::new(w, h, rgba);
-    let aspect = w as f32 / h.max(1) as f32;
+    let mut f = Frame::new(w, h, rgba, opts.transparent, opts.vignette);
     let view = cam.view();
-    let vp = cam.proj(aspect).mul(&view);
-    let eye = cam.eye();
+    let vp = match opts.crop {
+        Some((view_aspect, rect)) => M4::crop(rect).mul(&cam.proj(view_aspect)).mul(&view),
+        None => cam.proj(w as f32 / h.max(1) as f32).mul(&view),
+    };
+    let eye = cam.view_eye();
 
     // Ground grid (XY plane) + axes.
-    let n = 10i32;
-    for i in -n..=n {
-        if i == 0 {
-            continue;
+    if opts.grid {
+        let n = 10i32;
+        for i in -n..=n {
+            if i == 0 {
+                continue;
+            }
+            let a = i as f32;
+            let alpha = if i % 5 == 0 { 0.14 } else { 0.07 };
+            let g = [255.0, 255.0, 255.0];
+            let (p0, p1) = (clip(&vp, v3(a, -n as f32, 0.0)), clip(&vp, v3(a, n as f32, 0.0)));
+            f.line(p0, p1, g, alpha, 1.0 * scale.min(1.5), 0.0);
+            let (q0, q1) = (clip(&vp, v3(-n as f32, a, 0.0)), clip(&vp, v3(n as f32, a, 0.0)));
+            f.line(q0, q1, g, alpha, 1.0 * scale.min(1.5), 0.0);
         }
-        let a = i as f32;
-        let alpha = if i % 5 == 0 { 0.14 } else { 0.07 };
-        let g = [255.0, 255.0, 255.0];
-        let (p0, p1) = (clip(&vp, v3(a, -n as f32, 0.0)), clip(&vp, v3(a, n as f32, 0.0)));
-        f.line(p0, p1, g, alpha, 1.0 * scale.min(1.5), 0.0);
-        let (q0, q1) = (clip(&vp, v3(-n as f32, a, 0.0)), clip(&vp, v3(n as f32, a, 0.0)));
-        f.line(q0, q1, g, alpha, 1.0 * scale.min(1.5), 0.0);
+        let big = n as f32;
+        f.line(clip(&vp, v3(-big, 0.0, 0.0)), clip(&vp, v3(big, 0.0, 0.0)), [229.0, 83.0, 75.0], 0.55, 1.5 * scale, 0.0);
+        f.line(clip(&vp, v3(0.0, -big, 0.0)), clip(&vp, v3(0.0, big, 0.0)), [123.0, 200.0, 108.0], 0.55, 1.5 * scale, 0.0);
     }
-    let big = n as f32;
-    f.line(clip(&vp, v3(-big, 0.0, 0.0)), clip(&vp, v3(big, 0.0, 0.0)), [229.0, 83.0, 75.0], 0.55, 1.5 * scale, 0.0);
-    f.line(clip(&vp, v3(0.0, -big, 0.0)), clip(&vp, v3(0.0, big, 0.0)), [123.0, 200.0, 108.0], 0.55, 1.5 * scale, 0.0);
 
     // Faces: back-face cull, soft headlight + hemisphere shading (clay look).
     let light = eye.sub(cam.target).norm();
@@ -266,7 +312,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
             let b = clip(&vp, mesh.verts[face[(k + 1) % face.len()] as usize]);
             if is_active && scene.edit.is_none() {
                 f.line(a, b, ACCENT, 1.0, 2.2 * scale, 0.0008);
-            } else {
+            } else if opts.edges {
                 f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, 0.0005);
             }
         }

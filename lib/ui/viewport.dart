@@ -132,6 +132,60 @@ class ModelViewportController {
     return data?.buffer.asUint8List();
   }
 
+  // ----------------------------------------------------------------- capture --
+
+  bool _capturing = false;
+  bool get capturing => _capturing;
+
+  /// Logical size of the viewport (the frame rectangle is measured against it).
+  Size get viewSize => _state?._size ?? Size.zero;
+
+  void setOrtho(bool on) => _run((c) => c.setOrtho(on));
+
+  void setCapture(bool on, {bool grid = true, bool edges = true}) {
+    _capturing = on;
+    _run((c) => c.setCapture(on, grid: grid, edges: edges));
+    _state?._syncAngles();
+  }
+
+  (double, double, double, double) _norm(Rect r) {
+    final s = viewSize;
+    return (r.left / s.width, r.top / s.height, r.right / s.width, r.bottom / s.height);
+  }
+
+  /// Applies a capture preset framed to [frame] (logical px inside the viewport).
+  void applyPreset(int preset, Rect frame) {
+    final s = viewSize;
+    if (s.isEmpty) return;
+    _run((c) => c.applyPreset(preset, s.width / s.height, _norm(frame)));
+    _state?._syncAngles();
+  }
+
+  /// Zooms so everything fits in [frame], keeping the current direction.
+  void frameAll(Rect frame) {
+    final s = viewSize;
+    if (s.isEmpty) return;
+    _run((c) => c.frameAll(s.width / s.height, _norm(frame)));
+  }
+
+  /// PNG of exactly what [frame] shows, [longSide] pixels on its longer side.
+  Future<Uint8List?> exportPng(Rect frame, int longSide, {bool transparent = false}) async {
+    final s = viewSize;
+    final core = _state?._core;
+    if (core == null || s.isEmpty || frame.isEmpty) return null;
+    final k = longSide / math.max(frame.width, frame.height);
+    final w = math.max(1, (frame.width * k).round()), h = math.max(1, (frame.height * k).round());
+    // Lines keep the thickness they have on screen relative to the frame.
+    final rgba = core.renderExport(w, h, k, s.width / s.height, _norm(frame), transparent: transparent);
+    if (rgba == null) return null;
+    final done = Completer<ui.Image>();
+    ui.decodeImageFromPixels(rgba, w, h, ui.PixelFormat.rgba8888, done.complete);
+    final img = await done.future;
+    final data = await img.toByteData(format: ui.ImageByteFormat.png);
+    img.dispose();
+    return data?.buffer.asUint8List();
+  }
+
   void undo() {
     _state?._core.undo();
     _state?._changed();
@@ -193,6 +247,11 @@ class _ViewportState extends State<ModelViewport> {
       c.status.value = st;
       c.opRange.value = st & 8 != 0 ? _core.opRange() : null;
     }
+    _requestFrame();
+  }
+
+  void _syncAngles() {
+    widget.controller?.angles.value = _core.angles();
     _requestFrame();
   }
 
@@ -299,9 +358,9 @@ class _ViewportState extends State<ModelViewport> {
         final n = _norm(_lastUp);
         _core.tap(n.dx, n.dy, add: HardwareKeyboard.instance.isShiftPressed);
         _changed();
-      } else if (_maxPointers == 2) {
+      } else if (_maxPointers == 2 && !(widget.controller?.capturing ?? false)) {
         widget.controller?.undo();
-      } else if (_maxPointers == 3) {
+      } else if (_maxPointers == 3 && !(widget.controller?.capturing ?? false)) {
         widget.controller?.redo();
       }
     }

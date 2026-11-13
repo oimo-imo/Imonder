@@ -73,15 +73,10 @@ impl Scene {
         true
     }
 
-    /// Copy of the active object, placed next to it along +X.
+    /// Copy of the active object in exactly the same place; the copy becomes active.
     pub fn duplicate_active(&mut self) -> bool {
         let Some(src) = self.objects.get(self.active).cloned() else { return false };
-        let width = src.mesh.bounds().map_or(1.0, |(lo, hi)| hi.x - lo.x);
-        let mut mesh = src.mesh;
-        for v in &mut mesh.verts {
-            v.x += width * 1.2;
-        }
-        self.add(&src.name, mesh);
+        self.add(&src.name, src.mesh);
         true
     }
 
@@ -296,7 +291,7 @@ mod tests {
         assert_eq!(names, ["立方体", "立方体.001", "立方体.002"]);
         assert!(s.duplicate_active());
         assert_eq!(s.objects.last().unwrap().name, "立方体.003");
-        assert!(s.objects.last().unwrap().mesh.verts[0].x > 1.0, "copy sits beside the original");
+        assert_eq!(s.objects.last().unwrap().mesh, s.objects[0].mesh, "the copy sits exactly on the original");
         while s.remove_active() {}
         assert!(!s.has_active());
         assert!(!s.remove_active());

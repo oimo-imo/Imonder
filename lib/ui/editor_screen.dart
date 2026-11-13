@@ -1,9 +1,12 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 import '../storage/work_session.dart';
 import '../storage/work_store.dart';
 import '../update/update_sheet.dart';
 import '../update/updater.dart';
+import 'capture_overlay.dart';
 import 'gallery_screen.dart';
 import 'view_gizmo.dart';
 import 'viewport.dart';
@@ -15,9 +18,13 @@ const _muted = Color(0xFF8E8E95);
 // Status bits reported by the core (see Core::status in rust/src/lib.rs).
 const _bitEditMode = 64;
 const _bitHasActive = 128;
+const _bitOrtho = 256;
 
 class EditorScreen extends StatefulWidget {
-  const EditorScreen({super.key});
+  const EditorScreen({super.key, this.saveCapture});
+
+  /// Where captured images go (tests); the photo gallery when null.
+  final Future<void> Function(Uint8List png, String name)? saveCapture;
 
   @override
   State<EditorScreen> createState() => _EditorScreenState();
@@ -29,6 +36,7 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
   WorkSession? _session;
   int _tool = 0; // 0 move, 1 rotate, 2 scale, 3 loop cut
   ReleaseInfo? _pendingUpdate;
+  bool _capturing = false;
 
   /// Toolbar entries. `tool` >= 0 selects a tool with handles / tap behaviour, `op` >= 0 runs an
   /// operation on the selection right away, `all` selects everything. `kind` picks the action
@@ -299,7 +307,15 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
           child: ValueListenableBuilder<int>(
             valueListenable: _viewport.status,
             builder: (context, status, _) {
+              if (_capturing) {
+                return CaptureOverlay(
+                  viewport: _viewport,
+                  saveImage: widget.saveCapture,
+                  onClose: () => setState(() => _capturing = false),
+                );
+              }
               final editMode = status & _bitEditMode != 0;
+              final ortho = status & _bitOrtho != 0;
               return Stack(children: [
                 Positioned(top: 0, left: 0, right: 0, child: _topBar(accent, status)),
                 Positioned(
@@ -310,6 +326,29 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
                     onAxis: _viewport.snapAxis,
                     onReset: () => _viewport.snapView(3),
                     onOrbit: _viewport.orbit,
+                  ),
+                ),
+                Positioned(
+                  right: 40,
+                  top: top + 58 + 116,
+                  child: Tooltip(
+                    message: ortho ? '透視投影にする' : '平行投影にする',
+                    child: SizedBox(
+                      width: 44,
+                      height: 44,
+                      child: Material(
+                        color: ortho ? accent.withValues(alpha: 0.22) : _panel,
+                        borderRadius: BorderRadius.circular(14),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () => _viewport.setOrtho(!ortho),
+                          child: Center(
+                            child: Text(ortho ? '平行' : '透視',
+                                style: TextStyle(fontSize: 13, color: ortho ? accent : const Color(0xFFD4D4D9))),
+                          ),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
                 if (editMode && _tool == 3)
@@ -370,7 +409,7 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
       height: 52 + MediaQuery.paddingOf(context).top,
       child: Row(children: [
         _iconBtn(Icons.grid_view, 'ギャラリー', _session == null ? null : _openGallery),
-        _iconBtn(Icons.cloud_done_outlined, '端末に保存済み', null, color: _muted),
+        _iconBtn(Icons.photo_camera_outlined, '撮影', () => setState(() => _capturing = true), color: const Color(0xFFD4D4D9)),
         _iconBtn(Icons.system_update_alt, 'アップデート', _openSettings,
             color: _pendingUpdate != null ? accent : _muted, dot: _pendingUpdate != null),
         const Spacer(),

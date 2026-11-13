@@ -85,6 +85,41 @@ void main() {
     await settle(tester, rounds: 30);
   }, skip: skip);
 
+  testWidgets('capture: diorama preset, square 2K PNG saved, back to editing', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    final saved = <(Uint8List, String)>[];
+
+    await tester.pumpWidget(MaterialApp(
+      home: EditorScreen(saveCapture: (png, name) async => saved.add((png, name))),
+    ));
+    await settle(tester);
+    await tester.tap(find.byTooltip('撮影'));
+    await settle(tester, rounds: 20);
+    expect(find.text('箱庭'), findsOneWidget);
+    expect(find.byTooltip('ギャラリー'), findsNothing, reason: 'editing UI is hidden while capturing');
+    await tester.tap(find.text('箱庭'));
+    await settle(tester, rounds: 20);
+    await tester.tap(find.text('保存 2K'));
+    await settle(tester, rounds: 200);
+    expect(saved, hasLength(1));
+    final (png, name) = saved.single;
+    expect(name, startsWith('imonder_'));
+    expect(png.sublist(1, 4), 'PNG'.codeUnits);
+    final data = ByteData.sublistView(png);
+    expect((data.getUint32(16), data.getUint32(20)), (2048, 2048), reason: 'square, 2K');
+    expect(find.textContaining('写真に保存しました'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('撮影をやめる'));
+    await settle(tester, rounds: 20);
+    expect(find.byTooltip('ギャラリー'), findsOneWidget);
+    expect(find.text('透視'), findsOneWidget, reason: 'the editing view is perspective again');
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
   testWidgets('the gallery lists works and reports what was chosen', (tester) async {
     final store = WorkStore(Directory('${docs.path}/w')..createSync());
     final a = await tester.runAsync(() => store.create(name: 'ねこ'));
