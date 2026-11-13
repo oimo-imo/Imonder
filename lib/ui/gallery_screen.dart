@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../storage/work_store.dart';
+import '../update/update_sheet.dart';
 
 /// What the gallery asks the editor to do when it closes.
 sealed class GalleryChoice {
@@ -27,9 +28,12 @@ String formatDate(DateTime d) {
 }
 
 class GalleryScreen extends StatefulWidget {
-  const GalleryScreen({super.key, required this.store, required this.currentId});
+  const GalleryScreen({super.key, required this.store, required this.currentId, this.updateAvailable = false});
   final WorkStore store;
   final String? currentId;
+
+  /// Shows a dot on the update button.
+  final bool updateAvailable;
 
   @override
   State<GalleryScreen> createState() => _GalleryScreenState();
@@ -90,6 +94,15 @@ class _GalleryScreenState extends State<GalleryScreen> {
     }
   }
 
+  void _openUpdates() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF252528),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+      builder: (_) => const UpdateSheet(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
@@ -100,6 +113,16 @@ class _GalleryScreenState extends State<GalleryScreen> {
         backgroundColor: const Color(0xFF161618),
         title: const Text('ギャラリー'),
         actions: [
+          IconButton(
+            tooltip: widget.updateAvailable ? 'アップデートがあります' : 'アップデート',
+            onPressed: _openUpdates,
+            icon: Badge(
+              isLabelVisible: widget.updateAvailable,
+              backgroundColor: accent,
+              smallSize: 8,
+              child: Icon(Icons.system_update_alt, color: widget.updateAvailable ? accent : const Color(0xFF8E8E95)),
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 8),
             child: FilledButton.icon(

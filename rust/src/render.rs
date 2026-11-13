@@ -235,6 +235,9 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
         None => cam.proj(w as f32 / h.max(1) as f32).mul(&view),
     };
     let eye = cam.view_eye();
+    // Outlines sit a hair in front of their faces: 0.6% of the viewing distance, so they never
+    // poke through an object that is only slightly in front of them.
+    let line_bias = cam.depth_bias(cam.distance * 0.006);
 
     // Ground grid (XY plane) + axes.
     if opts.grid {
@@ -311,16 +314,16 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
             let a = clip(&vp, mesh.verts[face[k] as usize]);
             let b = clip(&vp, mesh.verts[face[(k + 1) % face.len()] as usize]);
             if is_active && scene.edit.is_none() {
-                f.line(a, b, ACCENT, 1.0, 2.2 * scale, 0.0008);
+                f.line(a, b, ACCENT, 1.0, 2.2 * scale, line_bias * 1.5);
             } else if opts.edges {
-                f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, 0.0005);
+                f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, line_bias);
             }
         }
     }
     }
 
     if let (Some(e), Some(obj)) = (&scene.edit, scene.objects.get(scene.active)) {
-        draw_edit_overlay(&mut f, &obj.mesh, e, &vp, eye, scale);
+        draw_edit_overlay(&mut f, &obj.mesh, e, &vp, eye, scale, line_bias * 2.0);
     }
     if let Some((centre, len, style)) = scene.handles {
         let c0 = clip(&vp, centre);
@@ -349,7 +352,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
     }
 }
 
-fn draw_edit_overlay(f: &mut Frame, mesh: &crate::mesh::Mesh, e: &EditOverlay, vp: &M4, eye: V3, scale: f32) {
+fn draw_edit_overlay(f: &mut Frame, mesh: &crate::mesh::Mesh, e: &EditOverlay, vp: &M4, eye: V3, scale: f32, bias: f32) {
     let visible_face: Vec<bool> = (0..mesh.faces.len()).map(|i| face_front_facing(mesh, i, eye)).collect();
 
     // Selected edges: explicit ones, or the outline of selected faces.
@@ -371,7 +374,7 @@ fn draw_edit_overlay(f: &mut Frame, mesh: &crate::mesh::Mesh, e: &EditOverlay, v
     for (a, b) in hot {
         let vis = edges.get(&(a, b)).map_or(false, |fs| fs.iter().any(|&fi| visible_face[fi]));
         if vis {
-            f.line(clip(vp, mesh.verts[a as usize]), clip(vp, mesh.verts[b as usize]), ACCENT, 1.0, 2.8 * scale, 0.002);
+            f.line(clip(vp, mesh.verts[a as usize]), clip(vp, mesh.verts[b as usize]), ACCENT, 1.0, 2.8 * scale, bias);
         }
     }
 
@@ -392,7 +395,7 @@ fn draw_edit_overlay(f: &mut Frame, mesh: &crate::mesh::Mesh, e: &EditOverlay, v
         } else {
             (3.2 * scale, [210.0, 210.0, 216.0])
         };
-        f.dot(clip(vp, mesh.verts[vi as usize]), r, col, 1.0, 0.002);
+        f.dot(clip(vp, mesh.verts[vi as usize]), r, col, 1.0, bias);
     }
 }
 

@@ -1622,6 +1622,58 @@ mod tests {
         assert!(c.tap(0.5, 0.5, false));
     }
 
+    /// A cube with another one tucked 0.15 behind it, offset so the back cube's left edge
+    /// (x = 0) runs right behind the front cube's face.
+    fn tucked_scene(ortho: bool) -> (Core, Core) {
+        let mut back = Core::new();
+        back.add_object(0);
+        for v in &mut back.scene.mesh_mut().unwrap().verts {
+            v.x += 1.0;
+            v.y += 0.15;
+        }
+        let mut alone = Core::new();
+        for c in [&mut back, &mut alone] {
+            c.camera.snap_axis(3);
+            c.camera.target = math::v3(0.5, 0.0, 0.3); // slightly off-axis so the edge is not hidden by symmetry
+            c.camera.yaw += 0.15;
+            c.camera.pitch = 0.2;
+            c.set_ortho(ortho);
+            c.set_capture(Some(CaptureOpts { grid: false, edges: true }));
+        }
+        (back, alone)
+    }
+
+    #[test]
+    fn hidden_edges_of_objects_behind_do_not_show_through() {
+        for ortho in [true, false] {
+            let (back, alone) = tucked_scene(ortho);
+            let (w, h) = (400usize, 300usize);
+            let (mut a, mut b) = (vec![0u8; w * h * 4], vec![0u8; w * h * 4]);
+            back.render(w, h, 1.0, &mut a);
+            alone.render(w, h, 1.0, &mut b);
+            // Inside the front cube's face, the picture must not change because of the hidden cube.
+            let view = alone.view();
+            let mesh = alone.mesh();
+            let face = &mesh.faces[2]; // -Y, facing the camera
+            let pts: Vec<_> = face.iter().map(|&v| view.project(mesh.verts[v as usize]).unwrap()).collect();
+            let (x0, x1) = pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+            let (y0, y1) = pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+            let to_px = |x: f32, y: f32| ((x / view.aspect * w as f32) as usize, (y * h as f32) as usize);
+            let (px0, py0) = to_px(x0, y0);
+            let (px1, py1) = to_px(x1, y1);
+            let mut diff = 0;
+            for y in py0 + 6..py1 - 6 {
+                for x in px0 + 6..px1 - 6 {
+                    let i = (y * w + x) * 4;
+                    if (0..3).any(|c| (a[i + c] as i32 - b[i + c] as i32).abs() > 6) {
+                        diff += 1;
+                    }
+                }
+            }
+            assert_eq!(diff, 0, "ortho={ortho}: {diff} pixels of hidden edges show through the front face");
+        }
+    }
+
     #[test]
     fn drag_without_handle_hit_does_nothing() {
         let mut c = front_core();
