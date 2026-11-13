@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -217,6 +218,52 @@ void main() {
     await settle(tester, rounds: 10);
     final button = tester.widget<IconButton>(find.ancestor(of: find.byIcon(Icons.library_add_check_outlined), matching: find.byType(IconButton)));
     expect(button.style, isNotNull, reason: 'highlighted while on');
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
+  testWidgets('export: glTF by default, OBJ of the selection, named after the work', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    final saved = <(String, Uint8List)>[];
+    await tester.pumpWidget(MaterialApp(
+      home: EditorScreen(saveExport: (name, bytes) async {
+        saved.add((name, bytes));
+        return '/somewhere/$name';
+      }),
+    ));
+    await settle(tester);
+    await tester.tap(find.byTooltip('追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('トーラス'));
+    await settle(tester, rounds: 10);
+
+    Future<void> openExport() async {
+      await tester.tap(find.byTooltip('シーン'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('書き出し（glTF / OBJ）'));
+      await settle(tester, rounds: 30);
+    }
+
+    await openExport();
+    await tester.tap(find.text('保存先を選んで書き出す'));
+    await settle(tester, rounds: 30);
+    expect(saved.last.$1, '無題.glb');
+    expect(String.fromCharCodes(saved.last.$2.sublist(0, 4)), 'glTF');
+    expect(find.textContaining('「無題.glb」を書き出しました'), findsOneWidget);
+
+    await openExport();
+    await tester.tap(find.text('OBJ (.obj)'));
+    await tester.tap(find.text('選択中だけ'));
+    await tester.pump();
+    await tester.tap(find.text('保存先を選んで書き出す'));
+    await settle(tester, rounds: 30);
+    expect(saved.last.$1, '無題.obj');
+    final text = utf8.decode(saved.last.$2);
+    expect(text, contains('o トーラス'));
+    expect(text, isNot(contains('o 立方体')), reason: 'only the selected torus');
 
     await tester.pumpWidget(const SizedBox());
     await settle(tester, rounds: 30);

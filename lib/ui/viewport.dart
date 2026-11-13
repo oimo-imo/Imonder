@@ -128,6 +128,10 @@ class ModelViewportController {
 
   void setSnap(bool on) => _run((c) => c.setSnap(on));
 
+  /// The model as `.glb` (default) or `.obj`.
+  Uint8List? exportModel({required bool obj, bool selectedOnly = false}) =>
+      _state?._core.exportModel(obj: obj, selectedOnly: selectedOnly);
+
   /// The visible objects, for saving as a preset.
   Uint8List? presetBytes() => _state?._core.visibleBytes();
 

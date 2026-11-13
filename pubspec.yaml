@@ -40,6 +40,7 @@ dependencies:
   path_provider: ^2.1.0
   open_filex: ^4.5.0
   gal: ^3.0.0
+  file_picker: ^11.0.3
 
 dev_dependencies:
   flutter_test:

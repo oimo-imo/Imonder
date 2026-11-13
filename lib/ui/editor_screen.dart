@@ -6,6 +6,7 @@ import '../storage/work_session.dart';
 import '../storage/work_store.dart';
 import '../update/updater.dart';
 import 'capture_overlay.dart';
+import 'export_sheet.dart';
 import 'gallery_screen.dart';
 import 'presets.dart';
 import 'view_gizmo.dart';
@@ -23,10 +24,13 @@ const _bitMany = 2048;
 const _bitGrouped = 4096;
 
 class EditorScreen extends StatefulWidget {
-  const EditorScreen({super.key, this.saveCapture});
+  const EditorScreen({super.key, this.saveCapture, this.saveExport});
 
   /// Where captured images go (tests); the photo gallery when null.
   final Future<void> Function(Uint8List png, String name)? saveCapture;
+
+  /// Where exported models go (tests); the system save dialog when null.
+  final SaveFile? saveExport;
 
   @override
   State<EditorScreen> createState() => _EditorScreenState();
@@ -229,6 +233,30 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     );
   }
 
+  Future<void> _showExport() async {
+    // Name the file after the work.
+    var base = 'imonder';
+    final store = _store, id = _session?.id;
+    if (store != null && id != null) {
+      for (final w in await store.list()) {
+        if (w.id == id) base = w.name;
+      }
+    }
+    if (!mounted) return;
+    final saved = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: const Color(0xFF252528),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+      builder: (_) => ExportSheet(
+        viewport: _viewport,
+        baseName: base,
+        hasSelection: _hasSelectedObject(),
+        save: widget.saveExport,
+      ),
+    );
+    if (saved != null) _toast('「$saved」を書き出しました');
+  }
+
   /// Saves the visible objects as a preset.
   Future<void> _savePreset() async {
     final presets = _presets;
@@ -264,6 +292,14 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
               Row(children: [
                 const SizedBox(width: 20),
                 const Expanded(child: Text('シーン', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600))),
+                IconButton(
+                  tooltip: '書き出し（glTF / OBJ）',
+                  icon: const Icon(Icons.ios_share),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _showExport();
+                  },
+                ),
                 IconButton(
                   tooltip: 'プリセットに登録',
                   icon: const Icon(Icons.bookmark_add_outlined),

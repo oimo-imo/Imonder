@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
@@ -143,6 +144,19 @@ void main() {
     expect(core.objects().length, 6);
     expect(core.deleteObject(), isTrue);
     expect(core.objects().length, 3);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
+
+  test('export: glb and obj', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.addObject(4);
+    final glb = core.exportModel(obj: false);
+    expect(String.fromCharCodes(glb.sublist(0, 4)), 'glTF');
+    final obj = String.fromCharCodes(core.exportModel(obj: true));
+    expect(obj, startsWith('# Imonder'));
+    final selected = utf8.decode(core.exportModel(obj: true, selectedOnly: true));
+    expect(selected, contains('o 球'));
+    expect(selected, isNot(contains('o 立方体')));
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
 }

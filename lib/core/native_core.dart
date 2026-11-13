@@ -27,6 +27,7 @@ typedef _Revision = int Function(Pointer<Void>);
 typedef _Thumb = int Function(Pointer<Void>, int, int, Pointer<Uint8>);
 typedef _Capture = void Function(Pointer<Void>, int, int, int);
 typedef _Preset = int Function(Pointer<Void>, int, double, double, double, double, double);
+typedef _Export2 = Pointer<Uint8> Function(Pointer<Void>, int, int, Pointer<Uint32>);
 typedef _FrameAll = void Function(Pointer<Void>, double, double, double, double, double);
 typedef _Export = int Function(Pointer<Void>, int, int, double, double, double, double, double, double, int, Pointer<Uint8>);
 
@@ -106,6 +107,7 @@ class NativeCore {
     _toggleObject = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_toggle_object');
     _selectAllObjects = l.lookupFunction<Void Function(Pointer<Void>), _Void>('imonder_select_all_objects');
     _groupObjects = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_group_objects');
+    _exportModel = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Int32, Int32, Pointer<Uint32>), _Export2>('imonder_export');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -158,6 +160,7 @@ class NativeCore {
   late final _Op _toggleObject;
   late final _Void _selectAllObjects;
   late final _Op _groupObjects;
+  late final _Export2 _exportModel;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -279,6 +282,16 @@ class NativeCore {
     final len = malloc<Uint32>();
     try {
       return _takeBytes(_save(_handle, len), len);
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  /// The visible objects (or only the selected ones) as glTF binary ([obj] false) or OBJ text.
+  Uint8List exportModel({required bool obj, bool selectedOnly = false}) {
+    final len = malloc<Uint32>();
+    try {
+      return _takeBytes(_exportModel(_handle, obj ? 1 : 0, selectedOnly ? 1 : 0, len), len);
     } finally {
       malloc.free(len);
     }

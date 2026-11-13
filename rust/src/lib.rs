@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod edit;
+pub mod export;
 pub mod math;
 pub mod mesh;
 pub mod ops;
@@ -811,6 +812,20 @@ impl Core {
         self.snap = on;
     }
 
+    // ------------------------------------------------------------------- export --
+
+    /// Visible objects (only the selected ones if `selected_only`) as `.glb` (format 0) or
+    /// `.obj` (format 1).
+    pub fn export(&self, format: i32, selected_only: bool) -> Vec<u8> {
+        let objects: Vec<&scene::Object> =
+            self.scene.objects.iter().filter(|o| o.visible && (!selected_only || o.selected)).collect();
+        if format == 1 {
+            export::to_obj(&objects).into_bytes()
+        } else {
+            export::to_glb(&objects)
+        }
+    }
+
     // ------------------------------------------------------------------ presets --
 
     /// The visible objects as a work file (for saving a preset).
@@ -1370,6 +1385,17 @@ pub unsafe extern "C" fn imonder_select_all_objects(core: *mut Core) {
 #[no_mangle]
 pub unsafe extern "C" fn imonder_group_objects(core: *mut Core, on: i32) -> i32 {
     core.as_mut().map_or(0, |c| c.group_objects(on != 0) as i32)
+}
+
+/// Exports the visible objects (or only the selected ones) as glTF binary (0) or OBJ (1).
+/// Free with `imonder_free_bytes`.
+///
+/// # Safety
+/// `core` must be live and `out_len` a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_export(core: *const Core, format: i32, selected_only: i32, out_len: *mut u32) -> *mut u8 {
+    let bytes = core.as_ref().map_or_else(Vec::new, |c| c.export(format, selected_only != 0));
+    leak_bytes(bytes, out_len)
 }
 
 #[cfg(test)]
@@ -2121,6 +2147,18 @@ mod tests {
         assert!(d.load(&c.to_bytes()));
         assert_eq!(d.scene.selected_indices(), vec![0, 2]);
         assert_eq!(d.scene.objects.iter().map(|o| o.group).collect::<Vec<_>>(), vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn export_respects_visibility_and_selection() {
+        let mut c = three_objects();
+        c.set_visible(1, false);
+        c.select_object(2);
+        let all = String::from_utf8(c.export(1, false)).unwrap();
+        assert!(all.contains("o 立方体") && !all.contains("o 球") && all.contains("o 円錐"));
+        let sel = String::from_utf8(c.export(1, true)).unwrap();
+        assert!(!sel.contains("o 立方体") && sel.contains("o 円錐"));
+        assert_eq!(&c.export(0, false)[0..4], b"glTF");
     }
 
     #[test]
