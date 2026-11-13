@@ -28,8 +28,35 @@ typedef _Thumb = int Function(Pointer<Void>, int, int, Pointer<Uint8>);
 typedef _Capture = void Function(Pointer<Void>, int, int, int);
 typedef _Preset = int Function(Pointer<Void>, int, double, double, double, double, double);
 typedef _Export2 = Pointer<Uint8> Function(Pointer<Void>, int, int, Pointer<Uint32>);
+typedef _ModSet = int Function(Pointer<Void>, int, int, double);
+typedef _ModFinish = int Function(Pointer<Void>, int, int);
 typedef _FrameAll = void Function(Pointer<Void>, double, double, double, double, double);
 typedef _Export = int Function(Pointer<Void>, int, int, double, double, double, double, double, double, int, Pointer<Uint8>);
+
+/// One modifier of the active object's stack.
+class ModifierInfo {
+  ModifierInfo.fromJson(Map<String, dynamic> j)
+      : kind = j['kind'] as String,
+        enabled = j['enabled'] as bool,
+        merge = j['merge'] as bool,
+        axes = j['kind'] == 'mirror' ? (j['axes'] as List).cast<bool>() : const [false, false, false],
+        count = (j['count'] as num?)?.toInt() ?? 0,
+        spacing = (j['spacing'] as num?)?.toDouble() ?? 0,
+        axis = (j['axis'] as num?)?.toInt() ?? 0;
+
+  /// 'mirror' or 'array'.
+  final String kind;
+  final bool enabled;
+  final bool merge;
+
+  /// Mirror: which axes reflect.
+  final List<bool> axes;
+
+  /// Array: copies, spacing (1 = touching), direction axis.
+  final int count;
+  final double spacing;
+  final int axis;
+}
 
 /// One entry of the scene list.
 class SceneObject {
@@ -108,6 +135,10 @@ class NativeCore {
     _selectAllObjects = l.lookupFunction<Void Function(Pointer<Void>), _Void>('imonder_select_all_objects');
     _groupObjects = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_group_objects');
     _exportModel = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Int32, Int32, Pointer<Uint32>), _Export2>('imonder_export');
+    _modifiersJson = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_modifiers_json');
+    _modifierAdd = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_modifier_add');
+    _modifierSet = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32, Float), _ModSet>('imonder_modifier_set');
+    _modifierFinish = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32), _ModFinish>('imonder_modifier_finish');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -161,6 +192,10 @@ class NativeCore {
   late final _Void _selectAllObjects;
   late final _Op _groupObjects;
   late final _Export2 _exportModel;
+  late final _Bytes _modifiersJson;
+  late final _Op _modifierAdd;
+  late final _ModSet _modifierSet;
+  late final _ModFinish _modifierFinish;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -286,6 +321,27 @@ class NativeCore {
       malloc.free(len);
     }
   }
+
+  // ---------------------------------------------------------------- modifiers --
+
+  List<ModifierInfo> modifiers() {
+    final len = malloc<Uint32>();
+    try {
+      final list = jsonDecode(utf8.decode(_takeBytes(_modifiersJson(_handle, len), len))) as List<dynamic>;
+      return [for (final m in list) ModifierInfo.fromJson(m as Map<String, dynamic>)];
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  /// Adds a modifier to the active object (0 mirror, 1 array); its index, or -1.
+  int modifierAdd(int kind) => _modifierAdd(_handle, kind);
+
+  /// Mirror params: 0 enabled, 1-3 X/Y/Z, 4 merge. Array: 0 enabled, 1 count, 2 spacing, 3 axis, 4 merge.
+  bool modifierSet(int index, int param, double value) => _modifierSet(_handle, index, param, value) == 1;
+
+  /// Applies (bakes, together with the ones above it) or removes a modifier.
+  bool modifierFinish(int index, {required bool apply}) => _modifierFinish(_handle, index, apply ? 1 : 0) == 1;
 
   /// The visible objects (or only the selected ones) as glTF binary ([obj] false) or OBJ text.
   Uint8List exportModel({required bool obj, bool selectedOnly = false}) {

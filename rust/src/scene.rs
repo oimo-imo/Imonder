@@ -3,6 +3,8 @@
 use crate::camera::Camera;
 use crate::math::{v3, V3};
 use crate::mesh::Mesh;
+use crate::modifier::Modifier;
+use std::borrow::Cow;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object {
@@ -13,11 +15,23 @@ pub struct Object {
     pub selected: bool,
     /// Objects sharing a non-zero group id are selected together.
     pub group: u32,
+    /// The object's pivot: moved with the object, not by editing its vertices. Mirrors reflect
+    /// across planes through it.
+    pub origin: V3,
+    /// Applied on top of `mesh`, in order, whenever the result is shown or exported.
+    pub modifiers: Vec<Modifier>,
 }
 
 impl Object {
+    /// A new object whose origin is the centre of its mesh.
     pub fn new(name: String, mesh: Mesh) -> Object {
-        Object { name, mesh, visible: true, selected: false, group: 0 }
+        let origin = mesh.bounds().map_or(v3(0.0, 0.0, 0.0), |(lo, hi)| lo.add(hi).scale(0.5));
+        Object { name, mesh, visible: true, selected: false, group: 0, origin, modifiers: Vec::new() }
+    }
+
+    /// The mesh with the modifier stack applied (borrowed when there is nothing to apply).
+    pub fn evaluated(&self) -> Cow<'_, Mesh> {
+        crate::modifier::evaluate(&self.mesh, self.origin, &self.modifiers)
     }
 }
 
@@ -177,9 +191,11 @@ impl Scene {
         for &i in &sel {
             let src = self.objects[i].clone();
             self.objects[i].selected = false;
-            let k = self.add(&src.name, src.mesh);
+            let k = self.add(&src.name, src.mesh.clone());
             self.objects[k].visible = src.visible;
             self.objects[k].selected = true;
+            self.objects[k].origin = src.origin;
+            self.objects[k].modifiers = src.modifiers.clone();
             if src.group != 0 {
                 self.objects[k].group = *remap.entry(src.group).or_insert_with(|| {
                     next_group += 1;
@@ -198,7 +214,7 @@ impl Scene {
     pub fn selection_bounds(&self) -> Option<(V3, V3)> {
         let mut out: Option<(V3, V3)> = None;
         for o in self.objects.iter().filter(|o| o.selected) {
-            if let Some((a, b)) = o.mesh.bounds() {
+            if let Some((a, b)) = o.evaluated().bounds() {
                 out = Some(match out {
                     None => (a, b),
                     Some((lo, hi)) => (
@@ -239,8 +255,9 @@ impl Scene {
     // ------------------------------------------------------------------ file format --
 
     const MAGIC: &'static [u8; 4] = b"IMND";
-    /// 2 added the selected flag and group id per object; version 1 files still open.
-    const VERSION: u32 = 2;
+    /// 2 added the selected flag and group id per object, 3 the origin and modifier stack.
+    /// Older files still open.
+    const VERSION: u32 = 3;
 
     /// Serialises the scene and the camera into the `.imnd` binary format.
     pub fn to_bytes(&self, cam: &Camera) -> Vec<u8> {
@@ -258,6 +275,28 @@ impl Scene {
             w.push(o.visible as u8);
             w.push(o.selected as u8);
             put_u32(&mut w, o.group);
+            for f in [o.origin.x, o.origin.y, o.origin.z] {
+                put_f32(&mut w, f);
+            }
+            put_u32(&mut w, o.modifiers.len() as u32);
+            for m in &o.modifiers {
+                match m {
+                    Modifier::Mirror { enabled, axes, merge } => {
+                        w.push(0);
+                        w.push(*enabled as u8);
+                        w.push(axes[0] as u8 | (axes[1] as u8) << 1 | (axes[2] as u8) << 2);
+                        w.push(*merge as u8);
+                    }
+                    Modifier::Array { enabled, count, spacing, axis, merge } => {
+                        w.push(1);
+                        w.push(*enabled as u8);
+                        put_u32(&mut w, *count);
+                        put_f32(&mut w, *spacing);
+                        w.push(*axis);
+                        w.push(*merge as u8);
+                    }
+                }
+            }
             put_u32(&mut w, o.mesh.verts.len() as u32);
             for v in &o.mesh.verts {
                 put_f32(&mut w, v.x);
@@ -282,7 +321,7 @@ impl Scene {
             return None;
         }
         let version = r.u32()?;
-        if version != 1 && version != Self::VERSION {
+        if !(1..=Self::VERSION).contains(&version) {
             return None;
         }
         let cam = Camera {
@@ -300,6 +339,34 @@ impl Scene {
             let name = String::from_utf8(r.take(name_len)?.to_vec()).ok()?;
             let visible = r.take(1)?[0] != 0;
             let (selected, group) = if version >= 2 { (r.take(1)?[0] != 0, r.u32()?) } else { (false, 0) };
+            let mut origin = None;
+            let mut modifiers = Vec::new();
+            if version >= 3 {
+                origin = Some(v3(r.f32()?, r.f32()?, r.f32()?));
+                let n = r.u32()? as usize;
+                if n > 64 {
+                    return None;
+                }
+                for _ in 0..n {
+                    let kind = r.take(1)?[0];
+                    let enabled = r.take(1)?[0] != 0;
+                    modifiers.push(match kind {
+                        0 => {
+                            let bits = r.take(1)?[0];
+                            let merge = r.take(1)?[0] != 0;
+                            Modifier::Mirror { enabled, axes: [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0], merge }
+                        }
+                        1 => {
+                            let count = r.u32()?.clamp(1, crate::modifier::MAX_ARRAY);
+                            let spacing = r.f32()?.clamp(-10.0, 10.0);
+                            let axis = r.take(1)?[0].min(2);
+                            let merge = r.take(1)?[0] != 0;
+                            Modifier::Array { enabled, count, spacing, axis, merge }
+                        }
+                        _ => return None,
+                    });
+                }
+            }
             let nv = r.u32()? as usize;
             let mut verts = Vec::new();
             for _ in 0..nv {
@@ -322,7 +389,12 @@ impl Scene {
                 }
                 faces.push(f);
             }
-            objects.push(Object { name, mesh: Mesh { verts, faces }, visible, selected, group });
+            let mut o = Object::new(name, Mesh { verts, faces });
+            (o.visible, o.selected, o.group, o.modifiers) = (visible, selected, group, modifiers);
+            if let Some(origin) = origin {
+                o.origin = origin;
+            }
+            objects.push(o);
         }
         if r.p != data.len() || (active >= objects.len() && !objects.is_empty()) {
             return None;
@@ -383,6 +455,11 @@ mod tests {
         let mut s = Scene::starter();
         s.add("球", Mesh::sphere(1.0, 8, 4));
         s.objects[1].visible = false;
+        s.objects[1].origin = v3(1.0, 2.0, 3.0);
+        s.objects[1].modifiers = vec![
+            Modifier::Mirror { enabled: true, axes: [true, false, true], merge: false },
+            Modifier::Array { enabled: false, count: 4, spacing: -0.5, axis: 1, merge: true },
+        ];
         s.active = 0;
         s
     }
@@ -506,7 +583,7 @@ mod tests {
         assert_eq!(s.objects[0].mesh, m);
         assert_eq!((s.objects[0].selected, s.objects[0].group), (false, 0));
         let mut future = w.clone();
-        future[4] = 3;
+        future[4] = 9;
         assert!(Scene::from_bytes(&future).is_none(), "unknown versions are refused");
     }
 

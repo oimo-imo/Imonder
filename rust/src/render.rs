@@ -311,7 +311,8 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
     if !obj.visible {
         continue;
     }
-    let mesh = &obj.mesh;
+    let evaluated = obj.evaluated();
+    let mesh: &crate::mesh::Mesh = &evaluated;
     let outlined = scene.highlight && obj.selected;
     let is_active = oi == scene.active;
     for (fi, face) in mesh.faces.iter().enumerate() {

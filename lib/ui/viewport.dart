@@ -128,6 +128,17 @@ class ModelViewportController {
 
   void setSnap(bool on) => _run((c) => c.setSnap(on));
 
+  List<ModifierInfo> modifiers() => _state?._core.modifiers() ?? const [];
+
+  int modifierAdd(int kind) {
+    var i = -1;
+    _run((c) => i = c.modifierAdd(kind));
+    return i;
+  }
+
+  void modifierSet(int index, int param, double value) => _run((c) => c.modifierSet(index, param, value));
+  void modifierFinish(int index, {required bool apply}) => _run((c) => c.modifierFinish(index, apply: apply));
+
   /// The model as `.glb` (default) or `.obj`.
   Uint8List? exportModel({required bool obj, bool selectedOnly = false}) =>
       _state?._core.exportModel(obj: obj, selectedOnly: selectedOnly);

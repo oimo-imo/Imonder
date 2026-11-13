@@ -18,6 +18,13 @@ Future<void> settle(WidgetTester tester, {int rounds = 120}) async {
   }
 }
 
+/// Taps a toolbar button, scrolling the toolbar first if the button is off screen.
+Future<void> tapTool(WidgetTester tester, String tooltip) async {
+  await tester.ensureVisible(find.byTooltip(tooltip));
+  await tester.pumpAndSettle();
+  await tester.tap(find.byTooltip(tooltip));
+}
+
 /// Runs the real UI against the real Rust library. Needs `cargo build --release` in rust/ first.
 void main() {
   final lib = File('rust/target/release/libimonder_core.so');
@@ -193,12 +200,12 @@ void main() {
     await tester.tap(find.text('球'));
     await settle(tester, rounds: 10);
 
-    await tester.tap(find.byTooltip('グループ化'));
+    await tapTool(tester, 'グループ化');
     await settle(tester, rounds: 10);
     expect(find.textContaining('2つ以上のオブジェクトを選んでください'), findsOneWidget);
-    await tester.tap(find.byTooltip('全選択'));
+    await tapTool(tester, '全選択');
     await settle(tester, rounds: 10);
-    await tester.tap(find.byTooltip('グループ化'));
+    await tapTool(tester, 'グループ化');
     await settle(tester, rounds: 10);
     expect(find.byTooltip('グループ解除'), findsOneWidget);
 
@@ -214,7 +221,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // The add-select toggle lights up.
-    await tester.tap(find.byTooltip('追加選択'));
+    await tapTool(tester, '追加選択');
     await settle(tester, rounds: 10);
     final button = tester.widget<IconButton>(find.ancestor(of: find.byIcon(Icons.library_add_check_outlined), matching: find.byType(IconButton)));
     expect(button.style, isNotNull, reason: 'highlighted while on');
@@ -264,6 +271,41 @@ void main() {
     final text = utf8.decode(saved.last.$2);
     expect(text, contains('o トーラス'));
     expect(text, isNot(contains('o 立方体')), reason: 'only the selected torus');
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
+  testWidgets('modifier sheet: add an array, change it, apply it', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(const MaterialApp(home: EditorScreen()));
+    await settle(tester);
+    await tapTool(tester, 'モディファイア');
+    await tester.pumpAndSettle();
+    expect(find.textContaining('「＋」でミラーか配列を追加します'), findsOneWidget);
+    await tester.tap(find.byTooltip('モディファイアを追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('配列'));
+    await tester.pumpAndSettle();
+    expect(find.text('3'), findsOneWidget, reason: 'three copies by default');
+    await tester.tap(find.byTooltip('増やす'));
+    await tester.pump();
+    expect(find.text('4'), findsOneWidget);
+    await tester.tap(find.text('Z').last);
+    await tester.pump();
+    await tester.tap(find.byTooltip('適用（形に焼き込む）'));
+    await tester.pump();
+    expect(find.textContaining('「＋」でミラーか配列を追加します'), findsOneWidget, reason: 'baked: the stack is empty again');
+    await tester.tapAt(const Offset(10, 300));
+    await tester.pumpAndSettle();
+    // Undo brings the modifier back (applying is one undo step).
+    await tester.tap(find.byTooltip('元に戻す'));
+    await tester.pump();
+    await tapTool(tester, 'モディファイア');
+    await tester.pumpAndSettle();
+    expect(find.text('4'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox());
     await settle(tester, rounds: 30);

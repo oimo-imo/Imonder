@@ -159,4 +159,27 @@ void main() {
     expect(selected, isNot(contains('o 立方体')));
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
+
+  test('modifiers: add, change, apply, remove', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    expect(core.modifiers(), isEmpty);
+    expect(core.modifierAdd(1), 0);
+    expect(core.modifierAdd(0), 1);
+    expect(core.modifierAdd(7), -1);
+    var m = core.modifiers();
+    expect(m.map((x) => x.kind), ['array', 'mirror']);
+    expect((m[0].count, m[0].spacing, m[0].axis), (3, 1.0, 0));
+    expect(m[1].axes, [true, false, false]);
+    expect(core.modifierSet(0, 1, 5), isTrue);
+    expect(core.modifierSet(1, 3, 1), isTrue);
+    m = core.modifiers();
+    expect(m[0].count, 5);
+    expect(m[1].axes, [true, false, true]);
+    expect(core.modifierFinish(1, apply: false), isTrue);
+    expect(core.modifierFinish(0, apply: true), isTrue);
+    expect(core.modifiers(), isEmpty);
+    final obj = utf8.decode(core.exportModel(obj: true));
+    expect(obj.split('\n').where((l) => l.startsWith('f ')).length, 30, reason: 'five cubes baked in');
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
 }

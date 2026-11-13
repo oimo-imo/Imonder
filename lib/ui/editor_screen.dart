@@ -8,6 +8,7 @@ import '../update/updater.dart';
 import 'capture_overlay.dart';
 import 'export_sheet.dart';
 import 'gallery_screen.dart';
+import 'modifier_sheet.dart';
 import 'presets.dart';
 import 'view_gizmo.dart';
 import 'viewport.dart';
@@ -61,18 +62,20 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     _ToolDef(Icons.delete_outline, '削除', op: 5, need: '先に選択してください'),
     _ToolDef(Icons.library_add_check_outlined, '追加選択', object: _ObjectAction.addSelect),
     _ToolDef(Icons.select_all, '全選択', all: true),
+    _ToolDef(Icons.auto_fix_high, 'モディファイア', object: _ObjectAction.modifiers),
   ];
 
   static const _objectTools = <_ToolDef>[
     _ToolDef(Icons.add_box_outlined, '追加', object: _ObjectAction.add),
-    _ToolDef(Icons.library_add_check_outlined, '追加選択', object: _ObjectAction.addSelect),
-    _ToolDef(Icons.select_all, '全選択', object: _ObjectAction.selectAll),
-    _ToolDef(Icons.workspaces_outline, 'グループ化', object: _ObjectAction.group),
     _ToolDef(Icons.open_with, '移動', tool: 0),
     _ToolDef(Icons.rotate_right, '回転', tool: 1),
     _ToolDef(Icons.zoom_out_map, '拡大縮小', tool: 2),
+    _ToolDef(Icons.auto_fix_high, 'モディファイア', object: _ObjectAction.modifiers),
     _ToolDef(Icons.copy_all_outlined, '複製', object: _ObjectAction.duplicate),
     _ToolDef(Icons.delete_outline, '削除', object: _ObjectAction.delete),
+    _ToolDef(Icons.library_add_check_outlined, '追加選択', object: _ObjectAction.addSelect),
+    _ToolDef(Icons.select_all, '全選択', object: _ObjectAction.selectAll),
+    _ToolDef(Icons.workspaces_outline, 'グループ化', object: _ObjectAction.group),
   ];
 
   static const _primitives = <(IconData, String)>[
@@ -383,6 +386,16 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
           _toast(_viewport.addSelect ? '追加選択：タップで選択に足す／外す' : '追加選択をオフにしました');
         case _ObjectAction.selectAll:
           _viewport.selectAllObjects();
+        case _ObjectAction.modifiers:
+          showModalBottomSheet<void>(
+            context: context,
+            isScrollControlled: true,
+            // Keep the model visible above the sheet while adjusting.
+            barrierColor: Colors.transparent,
+            backgroundColor: const Color(0xFF252528),
+            shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+            builder: (_) => ModifierSheet(viewport: _viewport),
+          );
         case _ObjectAction.group:
           if (status & _bitGrouped != 0) {
             _viewport.groupObjects(false);
@@ -658,7 +671,7 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
   }
 }
 
-enum _ObjectAction { add, duplicate, delete, addSelect, selectAll, group }
+enum _ObjectAction { add, duplicate, delete, addSelect, selectAll, group, modifiers }
 
 class _ToolDef {
   const _ToolDef(this.icon, this.label, {this.tool = -1, this.op = -1, this.all = false, this.need = '', this.object});

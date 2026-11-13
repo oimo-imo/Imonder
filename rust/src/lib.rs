@@ -3,6 +3,7 @@ pub mod edit;
 pub mod export;
 pub mod math;
 pub mod mesh;
+pub mod modifier;
 pub mod ops;
 pub mod render;
 pub mod scene;
@@ -110,6 +111,8 @@ pub struct Core {
     capture: Option<CaptureOpts>,
     /// Snap transforms to other objects' surfaces / the grid / angle and scale steps.
     pub snap: bool,
+    /// The modifier parameter last changed, so a slider drag becomes one undo step.
+    modifier_undo_key: Option<(usize, usize, i32)>,
     /// The editing camera, put back when capture mode ends.
     camera_before_capture: Option<Camera>,
 }
@@ -130,6 +133,7 @@ impl Core {
             rev: 0,
             capture: None,
             snap: false,
+            modifier_undo_key: None,
             camera_before_capture: None,
         }
     }
@@ -152,6 +156,7 @@ impl Core {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        self.modifier_undo_key = None;
         self.scene = s.scene;
         self.sel = s.sel;
         self.drag = None;
@@ -264,7 +269,7 @@ impl Core {
     fn visible_bounds(&self) -> Option<(V3, V3)> {
         let mut out: Option<(V3, V3)> = None;
         for o in self.scene.objects.iter().filter(|o| o.visible) {
-            if let Some((a, b)) = o.mesh.bounds() {
+            if let Some((a, b)) = o.evaluated().bounds() {
                 out = Some(match out {
                     None => (a, b),
                     Some((lo, hi)) => (
@@ -344,7 +349,7 @@ impl Core {
         let mut lo = math::v3(f32::MAX, f32::MAX, f32::MAX);
         let mut hi = math::v3(f32::MIN, f32::MIN, f32::MIN);
         for o in self.scene.objects.iter().filter(|o| o.visible) {
-            if let Some((a, b)) = o.mesh.bounds() {
+            if let Some((a, b)) = o.evaluated().bounds() {
                 lo = math::v3(lo.x.min(a.x), lo.y.min(a.y), lo.z.min(a.z));
                 hi = math::v3(hi.x.max(b.x), hi.y.max(b.y), hi.z.max(b.z));
             }
@@ -397,7 +402,7 @@ impl Core {
                 .iter()
                 .enumerate()
                 .filter(|(_, o)| o.visible)
-                .filter_map(|(i, o)| edit::pick_face(&o.mesh, &view, p).map(|(_, z)| (i, z)))
+                .filter_map(|(i, o)| edit::pick_face(&o.evaluated(), &view, p).map(|(_, z)| (i, z)))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             self.sel = Selection::new(self.sel.mode);
             match (hit, add) {
@@ -445,6 +450,7 @@ impl Core {
     }
 
     fn push_undo(&mut self) {
+        self.modifier_undo_key = None;
         let s = self.snapshot();
         self.undo.push(s);
         if self.undo.len() > MAX_HISTORY {
@@ -772,10 +778,13 @@ impl Core {
             }
         };
         for (oi, verts) in &targets {
-            let from = &base.objects[*oi].mesh;
-            let to = &mut self.scene.objects[*oi].mesh;
+            let from = &base.objects[*oi];
+            let to = &mut self.scene.objects[*oi];
             for &vi in verts {
-                to.verts[vi as usize] = apply(from.verts[vi as usize]);
+                to.mesh.verts[vi as usize] = apply(from.mesh.verts[vi as usize]);
+            }
+            if !self.edit_mode {
+                to.origin = apply(from.origin); // the pivot travels with the object
             }
         }
         self.rev += 1;
@@ -787,23 +796,31 @@ impl Core {
         let mut moved: Vec<V3> = Vec::new();
         let mut moved_faces: Vec<Vec<V3>> = Vec::new();
         for (oi, verts) in targets {
-            let mesh = &base.objects[*oi].mesh;
-            moved.extend(verts.iter().map(|&i| mesh.verts[i as usize]));
-            moved_faces.extend(
-                mesh.faces
-                    .iter()
-                    .filter(|f| f.iter().all(|i| verts.contains(i)))
-                    .map(|f| f.iter().map(|&i| mesh.verts[i as usize]).collect()),
-            );
+            if self.edit_mode {
+                let mesh = &base.objects[*oi].mesh;
+                moved.extend(verts.iter().map(|&i| mesh.verts[i as usize]));
+                moved_faces.extend(
+                    mesh.faces
+                        .iter()
+                        .filter(|f| f.iter().all(|i| verts.contains(i)))
+                        .map(|f| f.iter().map(|&i| mesh.verts[i as usize]).collect()),
+                );
+            } else {
+                // Whole objects move, modifier results included.
+                let mesh = base.objects[*oi].evaluated();
+                moved.extend(mesh.verts.iter().copied());
+                moved_faces.extend(mesh.faces.iter().map(|f| f.iter().map(|&i| mesh.verts[i as usize]).collect()));
+            }
         }
         let moving: std::collections::BTreeSet<usize> = targets.iter().map(|(i, _)| *i).collect();
-        let others: Vec<&Mesh> = base
+        let others: Vec<std::borrow::Cow<'_, Mesh>> = base
             .objects
             .iter()
             .enumerate()
             .filter(|(i, o)| !moving.contains(i) && o.visible)
-            .map(|(_, o)| &o.mesh)
+            .map(|(_, o)| o.evaluated())
             .collect();
+        let others: Vec<&Mesh> = others.iter().map(|m| &**m).collect();
         let d = self.camera.distance;
         snap::snap_move(&moved, &moved_faces, &others, axis, free, d * 0.04, snap::grid_step(d))
     }
@@ -812,13 +829,90 @@ impl Core {
         self.snap = on;
     }
 
+    // ---------------------------------------------------------------- modifiers --
+
+    /// The active object's modifier stack as JSON.
+    pub fn modifiers_json(&self) -> String {
+        let items: Vec<String> = self
+            .scene
+            .objects
+            .get(self.scene.active)
+            .map_or(Vec::new(), |o| o.modifiers.iter().map(|m| m.to_json()).collect());
+        format!("[{}]", items.join(","))
+    }
+
+    /// Adds a modifier (0 mirror, 1 array) to the active object. Returns its index.
+    pub fn modifier_add(&mut self, kind: i32) -> Option<usize> {
+        let m = modifier::Modifier::new(kind)?;
+        if !self.scene.has_active() {
+            return None;
+        }
+        self.push_undo();
+        let o = &mut self.scene.objects[self.scene.active];
+        o.modifiers.push(m);
+        Some(o.modifiers.len() - 1)
+    }
+
+    /// Changes one parameter. Repeated changes of the same parameter (a slider being dragged)
+    /// make a single undo step.
+    pub fn modifier_set(&mut self, index: usize, param: i32, value: f32) -> bool {
+        let active = self.scene.active;
+        let mut probe = match self.scene.objects.get(active).and_then(|o| o.modifiers.get(index)) {
+            Some(m) => m.clone(),
+            None => return false,
+        };
+        if !probe.set(param, value) {
+            return false;
+        }
+        let key = (active, index, param);
+        if self.modifier_undo_key != Some(key) {
+            self.push_undo();
+            self.modifier_undo_key = Some(key);
+        }
+        self.scene.objects[active].modifiers[index] = probe;
+        self.rev += 1;
+        true
+    }
+
+    pub fn modifier_remove(&mut self, index: usize) -> bool {
+        if self.scene.objects.get(self.scene.active).map_or(true, |o| index >= o.modifiers.len()) {
+            return false;
+        }
+        self.push_undo();
+        self.scene.objects[self.scene.active].modifiers.remove(index);
+        true
+    }
+
+    /// Bakes the modifiers up to and including `index` into the mesh and removes them.
+    pub fn modifier_apply(&mut self, index: usize) -> bool {
+        let active = self.scene.active;
+        let Some(o) = self.scene.objects.get(active) else { return false };
+        if index >= o.modifiers.len() {
+            return false;
+        }
+        let baked = modifier::apply_all(&o.mesh, o.origin, &o.modifiers[..=index]);
+        self.push_undo();
+        let o = &mut self.scene.objects[active];
+        o.mesh = baked;
+        o.modifiers.drain(..=index);
+        self.sel = Selection::new(self.sel.mode);
+        self.last_op = None;
+        true
+    }
+
     // ------------------------------------------------------------------- export --
 
     /// Visible objects (only the selected ones if `selected_only`) as `.glb` (format 0) or
     /// `.obj` (format 1).
     pub fn export(&self, format: i32, selected_only: bool) -> Vec<u8> {
-        let objects: Vec<&scene::Object> =
-            self.scene.objects.iter().filter(|o| o.visible && (!selected_only || o.selected)).collect();
+        let baked: Vec<scene::Object> = self
+            .scene
+            .objects
+            .iter()
+            .filter(|o| o.visible && (!selected_only || o.selected))
+            .map(|o| scene::Object::new(o.name.clone(), o.evaluated().into_owned()))
+            .collect();
+        let objects: Vec<&scene::Object> = baked.iter().collect();
         if format == 1 {
             export::to_obj(&objects).into_bytes()
         } else {
@@ -850,8 +944,8 @@ impl Core {
         self.scene.clear_selection();
         for o in incoming.objects {
             let i = self.scene.add(&o.name, o.mesh);
-            self.scene.objects[i].visible = o.visible;
-            self.scene.objects[i].selected = true;
+            let new = &mut self.scene.objects[i];
+            (new.visible, new.selected, new.origin, new.modifiers) = (o.visible, true, o.origin, o.modifiers);
         }
         // The pieces of a preset move together.
         self.scene.group_selected();
@@ -1396,6 +1490,47 @@ pub unsafe extern "C" fn imonder_group_objects(core: *mut Core, on: i32) -> i32 
 pub unsafe extern "C" fn imonder_export(core: *const Core, format: i32, selected_only: i32, out_len: *mut u32) -> *mut u8 {
     let bytes = core.as_ref().map_or_else(Vec::new, |c| c.export(format, selected_only != 0));
     leak_bytes(bytes, out_len)
+}
+
+/// The active object's modifier stack as UTF-8 JSON. Free with `imonder_free_bytes`.
+///
+/// # Safety
+/// `core` must be live and `out_len` a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifiers_json(core: *const Core, out_len: *mut u32) -> *mut u8 {
+    let json = core.as_ref().map_or_else(|| "[]".to_string(), |c| c.modifiers_json());
+    leak_bytes(json.into_bytes(), out_len)
+}
+
+/// Adds a modifier (0 mirror, 1 array) to the active object. Returns its index or -1.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifier_add(core: *mut Core, kind: i32) -> i32 {
+    core.as_mut().and_then(|c| c.modifier_add(kind)).map_or(-1, |i| i as i32)
+}
+
+/// Sets a modifier parameter (see `Modifier::set`). Returns 1 on success.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifier_set(core: *mut Core, index: i32, param: i32, value: f32) -> i32 {
+    core.as_mut().map_or(0, |c| (index >= 0 && c.modifier_set(index as usize, param, value)) as i32)
+}
+
+/// Removes (`apply` = 0) or applies (`apply` = 1) the modifier at `index`.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_modifier_finish(core: *mut Core, index: i32, apply: i32) -> i32 {
+    let Some(c) = core.as_mut() else { return 0 };
+    if index < 0 {
+        return 0;
+    }
+    (if apply != 0 { c.modifier_apply(index as usize) } else { c.modifier_remove(index as usize) }) as i32
 }
 
 #[cfg(test)]
@@ -2191,6 +2326,83 @@ mod tests {
         };
         let (near, far) = (ink(7.0), ink(40.0));
         assert!(far < near * 0.75, "far {far} vs near {near}");
+    }
+
+    #[test]
+    fn mirror_follows_the_object_and_shows_everywhere() {
+        let mut c = object_core();
+        // Model the +X half of a box sitting right of the origin.
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x = v.x * 0.5 + 0.5; // x: 0..1
+        }
+        c.scene.objects[0].origin = math::v3(0.0, 0.0, 0.0);
+        assert_eq!(c.modifier_add(modifier::KIND_MIRROR), Some(0));
+        let (lo, hi) = c.scene.objects[0].evaluated().bounds().unwrap();
+        assert_eq!((lo.x, hi.x), (-1.0, 1.0));
+        // Moving the object moves the origin, so the mirror travels along.
+        c.select_object(0);
+        c.begin_transform(Drag::Move { axis: 0, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 0, free: 3.0 });
+        c.drag_end();
+        assert_eq!(c.scene.objects[0].origin.x, 3.0);
+        let (lo, hi) = c.scene.objects[0].evaluated().bounds().unwrap();
+        assert_eq!((lo.x, hi.x), (2.0, 4.0));
+        // Editing vertices does not move the origin.
+        c.set_edit_mode(true);
+        c.select_all();
+        c.begin_transform(Drag::Move { axis: 0, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 0, free: 0.5 });
+        c.drag_end();
+        assert_eq!(c.scene.objects[0].origin.x, 3.0);
+        c.set_edit_mode(false);
+        // The export and the object's bounds include the mirrored half.
+        let obj = String::from_utf8(c.export(1, false)).unwrap();
+        assert_eq!(obj.lines().filter(|l| l.starts_with("v ")).count(), 16, "two separate halves after the edit");
+        assert_eq!(c.scene.selection_bounds().unwrap().0.x, 1.5);
+    }
+
+    #[test]
+    fn modifier_sliders_make_one_undo_step_and_apply_bakes() {
+        let mut c = object_core();
+        let i = c.modifier_add(modifier::KIND_ARRAY).unwrap();
+        let steps = c.undo.len();
+        for v in [1.1, 1.2, 1.3, 1.5] {
+            assert!(c.modifier_set(i, 2, v));
+        }
+        assert_eq!(c.undo.len(), steps + 1, "dragging the spacing slider is one step");
+        assert!(c.modifier_set(i, 1, 5.0));
+        assert_eq!(c.undo.len(), steps + 2, "another parameter is another step");
+        assert!(c.modifiers_json().contains("\"count\":5"));
+        assert!(c.undo());
+        assert!(c.modifiers_json().contains("\"count\":3") && c.modifiers_json().contains("\"spacing\":1.5"));
+        assert!(c.modifier_apply(i));
+        assert_eq!(c.mesh().faces.len(), 18, "three cubes baked in");
+        assert_eq!(c.modifiers_json(), "[]");
+        assert!(!c.modifier_set(0, 1, 2.0));
+        assert!(c.undo());
+        assert_eq!(c.mesh().faces.len(), 6);
+        assert!(c.modifier_remove(0));
+        assert_eq!(c.modifiers_json(), "[]");
+    }
+
+    #[test]
+    fn picking_hits_mirrored_geometry_and_duplicates_keep_modifiers() {
+        let mut c = object_core();
+        c.camera.distance = 12.0;
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x = v.x * 0.5 + 3.5; // a small box at x 3..4
+        }
+        c.scene.objects[0].origin = math::v3(0.0, 0.0, 0.0);
+        c.modifier_add(modifier::KIND_MIRROR); // its mirror image sits at x -4..-3
+        c.scene.clear_selection();
+        let mut buf = vec![0u8; 400 * 300 * 4];
+        c.render(400, 300, 1.0, &mut buf);
+        let view = c.view();
+        let p = view.project(math::v3(-3.5, 0.0, 0.0)).unwrap();
+        assert!(c.tap(p.0 / view.aspect, p.1, false), "tapping the mirrored half selects the object");
+        assert!(c.duplicate_object());
+        assert_eq!(c.scene.objects[1].modifiers.len(), 1);
+        assert_eq!(c.scene.objects[1].origin, c.scene.objects[0].origin);
     }
 
     #[test]
