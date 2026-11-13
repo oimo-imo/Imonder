@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import '../ui/viewport.dart';
 import 'work_store.dart';
@@ -75,10 +76,12 @@ class WorkSession {
     return false;
   }
 
-  Future<void> createNew() async {
+  /// Starts a new work: the default cube, or a copy of [from] (a preset).
+  Future<void> createNew({Uint8List? from}) async {
     await flush();
     final wid = await store.create();
     viewport.newWork();
+    if (from != null) viewport.loadBytes(from);
     id = wid;
     _savedRevision = viewport.revision;
     await store.setLastOpened(wid);

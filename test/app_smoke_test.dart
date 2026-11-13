@@ -120,6 +120,67 @@ void main() {
     await settle(tester, rounds: 30);
   }, skip: skip);
 
+  testWidgets('presets: save visible objects, insert them, start a new work from one; snap toggle', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(const MaterialApp(home: EditorScreen()));
+    await settle(tester);
+
+    Future<List<String>> sceneNames() async {
+      await tester.tap(find.byTooltip('シーン'));
+      await tester.pumpAndSettle();
+      final names = tester
+          .widgetList<ListTile>(find.byType(ListTile))
+          .map((t) => (t.title as Text).data!)
+          .toList();
+      await tester.tapAt(const Offset(10, 10));
+      await tester.pumpAndSettle();
+      return names;
+    }
+
+    // Snap toggle.
+    expect(find.byTooltip('スナップ：オフ'), findsOneWidget);
+    await tester.tap(find.byTooltip('スナップ：オフ'));
+    await tester.pump();
+    expect(find.byTooltip('スナップ：オン'), findsOneWidget);
+
+    // Cube + sphere, saved as a preset.
+    await tester.tap(find.byTooltip('追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('球'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('シーン'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('プリセットに登録'));
+    await settle(tester, rounds: 20);
+    await tester.enterText(find.byType(TextField), 'へや');
+    await tester.tap(find.text('登録'));
+    await settle(tester, rounds: 60);
+    expect(find.textContaining('「へや」をプリセットに登録しました'), findsOneWidget);
+
+    // Inserted from the add menu: the objects come in next to the existing ones.
+    await tester.tap(find.byTooltip('追加'));
+    await settle(tester, rounds: 30);
+    expect(find.text('へや'), findsOneWidget);
+    await tester.tap(find.text('へや'));
+    await settle(tester, rounds: 30);
+    expect(await sceneNames(), ['立方体', '球', '立方体.001', '球.001']);
+
+    // A new work started from the preset holds exactly its objects.
+    await tester.tap(find.byTooltip('ギャラリー'));
+    await settle(tester, rounds: 40);
+    await tester.tap(find.text('新規'));
+    await settle(tester, rounds: 30);
+    expect(find.text('空の作品（立方体ひとつ）'), findsOneWidget);
+    await tester.tap(find.text('へや'));
+    await settle(tester, rounds: 60);
+    expect(await sceneNames(), ['立方体', '球']);
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
   testWidgets('the gallery lists works and reports what was chosen', (tester) async {
     final store = WorkStore(Directory('${docs.path}/w')..createSync());
     final a = await tester.runAsync(() => store.create(name: 'ねこ'));

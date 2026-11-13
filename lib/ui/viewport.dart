@@ -114,6 +114,18 @@ class ModelViewportController {
     return ok;
   }
 
+  void setSnap(bool on) => _run((c) => c.setSnap(on));
+
+  /// The visible objects, for saving as a preset.
+  Uint8List? presetBytes() => _state?._core.visibleBytes();
+
+  /// Adds a preset's objects to the work.
+  bool insertPreset(Uint8List data) {
+    var ok = false;
+    _run((c) => ok = c.insert(data));
+    return ok;
+  }
+
   void newWork() {
     _state?._core.newWork();
     _editMode = false;

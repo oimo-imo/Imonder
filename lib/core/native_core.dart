@@ -96,6 +96,9 @@ class NativeCore {
     _renderExport = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Float, Float, Float, Float, Float, Int32, Pointer<Uint8>),
         _Export>('imonder_render_export');
+    _setSnap = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_snap');
+    _visibleBytes = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_visible_bytes');
+    _insert = l.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint8>, Uint32), _Load>('imonder_insert');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -142,6 +145,9 @@ class NativeCore {
   late final _Preset _applyPreset;
   late final _FrameAll _frameAll;
   late final _Export _renderExport;
+  late final _Flag _setSnap;
+  late final _Bytes _visibleBytes;
+  late final _Load _insert;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -254,6 +260,32 @@ class NativeCore {
       return _takeBytes(_save(_handle, len), len);
     } finally {
       malloc.free(len);
+    }
+  }
+
+  /// Snap transforms to other objects' surfaces, the grid, 15° and 0.1x steps.
+  void setSnap(bool on) => _setSnap(_handle, on ? 1 : 0);
+
+  /// The visible objects as a work file (for saving a preset).
+  Uint8List visibleBytes() {
+    final len = malloc<Uint32>();
+    try {
+      return _takeBytes(_visibleBytes(_handle, len), len);
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  /// Adds a preset's objects to the work; false if the data is not a valid work.
+  bool insert(Uint8List data) => _withBytes(data, (p) => _insert(_handle, p, data.length) == 1);
+
+  bool _withBytes(Uint8List data, bool Function(Pointer<Uint8>) f) {
+    final p = malloc<Uint8>(data.isEmpty ? 1 : data.length);
+    try {
+      p.asTypedList(data.length).setAll(0, data);
+      return f(p);
+    } finally {
+      malloc.free(p);
     }
   }
 

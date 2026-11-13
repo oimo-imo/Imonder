@@ -19,9 +19,10 @@ class WorkStore {
   WorkStore(this.root);
   final Directory root;
 
-  static Future<WorkStore> open() async {
+  /// Works live in `works/`; presets (saved sets of objects) use the same format in `presets/`.
+  static Future<WorkStore> open({String folder = 'works'}) async {
     final docs = await getApplicationDocumentsDirectory();
-    final dir = Directory('${docs.path}${Platform.pathSeparator}works');
+    final dir = Directory('${docs.path}${Platform.pathSeparator}$folder');
     await dir.create(recursive: true);
     return WorkStore(dir);
   }

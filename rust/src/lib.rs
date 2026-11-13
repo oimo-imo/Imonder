@@ -5,12 +5,14 @@ pub mod mesh;
 pub mod ops;
 pub mod render;
 pub mod scene;
+pub mod snap;
 
 use std::cell::Cell;
 
 use camera::Camera;
 use edit::{SelectMode, Selection, Snapshot, View};
 use scene::Scene;
+
 use math::V3;
 use mesh::Mesh;
 
@@ -42,9 +44,12 @@ impl Tool {
 
 #[derive(Clone, Copy, Debug)]
 enum Drag {
-    Move(usize),
-    Scale(usize), // 0..3 axis, 3 = uniform
-    Rotate { axis: usize, last: (f32, f32) },
+    /// `free`: how far the finger has dragged in total (world units along the axis).
+    Move { axis: usize, free: f32 },
+    /// `axis` 0..3, 3 = uniform; `free`: the total factor dragged so far.
+    Scale { axis: usize, free: f32 },
+    /// `free`: the total angle dragged so far.
+    Rotate { axis: usize, last: (f32, f32), free: f32 },
 }
 
 /// The last operation, kept so its value can be adjusted by redoing it from `base`.
@@ -102,6 +107,8 @@ pub struct Core {
     rev: u64,
     /// Capture mode: the view shows exactly what an exported image will look like.
     capture: Option<CaptureOpts>,
+    /// Snap transforms to other objects' surfaces / the grid / angle and scale steps.
+    pub snap: bool,
     /// The editing camera, put back when capture mode ends.
     camera_before_capture: Option<Camera>,
 }
@@ -121,6 +128,7 @@ impl Core {
             aspect: Cell::new(1.0),
             rev: 0,
             capture: None,
+            snap: false,
             camera_before_capture: None,
         }
     }
@@ -434,7 +442,7 @@ impl Core {
 
     /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected,
     /// bit 3: an adjustable operation is active, bits 4-5: select mode (0 vertex, 1 edge, 2 face),
-    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode.
+    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode, bit 10: snapping.
     pub fn status(&self) -> i32 {
         (!self.undo.is_empty()) as i32
             | ((!self.redo.is_empty()) as i32) << 1
@@ -449,6 +457,7 @@ impl Core {
             | (self.scene.has_active() as i32) << 7
             | (self.camera.ortho as i32) << 8
             | (self.capture.is_some() as i32) << 9
+            | (self.snap as i32) << 10
     }
 
     // -------------------------------------------------------------------- objects --
@@ -592,26 +601,32 @@ impl Core {
         let view = self.view();
         let p = (nx * view.aspect, ny);
         let drag = match style {
-            render::HandleStyle::Move => edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(Drag::Move),
+            render::HandleStyle::Move => edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(|axis| Drag::Move { axis, free: 0.0 }),
             render::HandleStyle::Scale => {
                 let near_centre = view
                     .project(centre)
                     .map_or(false, |c| ((c.0 - p.0).powi(2) + (c.1 - p.1).powi(2)).sqrt() < HANDLE_RADIUS * 0.8);
                 if near_centre {
-                    Some(Drag::Scale(3))
+                    Some(Drag::Scale { axis: 3, free: 1.0 })
                 } else {
-                    edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(Drag::Scale)
+                    edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(|axis| Drag::Scale { axis, free: 1.0 })
                 }
             }
             render::HandleStyle::Rotate => {
-                edit::pick_ring(&view, centre, len * 0.9, p, HANDLE_RADIUS * 0.7).map(|axis| Drag::Rotate { axis, last: p })
+                edit::pick_ring(&view, centre, len * 0.9, p, HANDLE_RADIUS * 0.7).map(|axis| Drag::Rotate { axis, last: p, free: 0.0 })
             }
         };
         let Some(drag) = drag else { return false };
+        self.begin_transform(drag);
+        true
+    }
+
+    /// Records the undo step the drag works from: every update recomputes the result from
+    /// that starting state, so snapping never accumulates rounding.
+    fn begin_transform(&mut self, drag: Drag) {
         self.last_op = None;
         self.push_undo();
         self.drag = Some(drag);
-        true
     }
 
     /// Applies a drag step. Deltas are fractions of width / height.
@@ -619,16 +634,12 @@ impl Core {
         let (Some(drag), Some((centre, len, _))) = (self.drag, self.handle_geometry()) else { return };
         let view = self.view();
         let d = (dnx * view.aspect, dny);
-        let verts = self.transform_verts();
-        let mut next_drag = drag;
-        let apply: Box<dyn Fn(V3) -> V3>;
-        match drag {
-            Drag::Move(axis) => {
+        let next = match drag {
+            Drag::Move { axis, free } => {
                 let Some(t) = axis_drag(&view, centre, axis, d) else { return };
-                let dir = edit::axis_vec(axis);
-                apply = Box::new(move |v| v.add(dir.scale(t)));
+                Drag::Move { axis, free: free + t }
             }
-            Drag::Scale(axis) => {
+            Drag::Scale { axis, free } => {
                 let f = if axis == 3 {
                     1.0 + (d.0 - d.1) * 2.0
                 } else {
@@ -636,17 +647,9 @@ impl Core {
                     1.0 + t / len
                 }
                 .max(0.05);
-                let k = edit::axis_vec(axis.min(2));
-                apply = if axis == 3 {
-                    Box::new(move |v| centre.add(v.sub(centre).scale(f)))
-                } else {
-                    Box::new(move |v| {
-                        let rel = v.sub(centre);
-                        centre.add(rel.add(k.scale(k.dot(rel) * (f - 1.0))))
-                    })
-                };
+                Drag::Scale { axis, free: (free * f).max(0.01) }
             }
-            Drag::Rotate { axis, last } => {
+            Drag::Rotate { axis, last, free } => {
                 let Some(c) = view.project(centre) else { return };
                 let now = (last.0 + d.0, last.1 + d.1);
                 // Screen angles with y pointing up, so counter-clockwise is positive.
@@ -658,22 +661,110 @@ impl Core {
                 while da < -std::f32::consts::PI {
                     da += std::f32::consts::TAU;
                 }
-                let k = edit::axis_vec(axis);
-                if view.eye.sub(centre).dot(k) < 0.0 {
+                if view.eye.sub(centre).dot(edit::axis_vec(axis)) < 0.0 {
                     da = -da; // seen from the negative side the rotation looks reversed
                 }
-                apply = Box::new(move |v| edit::rotate_about(v, centre, k, da));
-                next_drag = Drag::Rotate { axis, last: now };
+                Drag::Rotate { axis, last: now, free: free + da }
             }
+        };
+        self.drag = Some(next);
+        self.apply_transform(next);
+    }
+
+    /// Sets the moving vertices to their starting positions transformed by the drag so far
+    /// (snapped when snapping is on).
+    fn apply_transform(&mut self, drag: Drag) {
+        let Some(base) = self.undo.last().map(|s| s.scene.mesh().clone()) else { return };
+        let verts = self.transform_verts();
+        if verts.is_empty() || base.verts.len() != self.mesh().verts.len() {
+            return;
         }
+        let pivot = if self.edit_mode {
+            verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(base.verts[i as usize])).scale(1.0 / verts.len() as f32)
+        } else {
+            base.bounds().map_or(math::v3(0.0, 0.0, 0.0), |(lo, hi)| lo.add(hi).scale(0.5))
+        };
+        let apply: Box<dyn Fn(V3) -> V3> = match drag {
+            Drag::Move { axis, free } => {
+                let t = if self.snap { self.snapped_move(&base, &verts, axis, free) } else { free };
+                let dir = edit::axis_vec(axis);
+                Box::new(move |v| v.add(dir.scale(t)))
+            }
+            Drag::Scale { axis, free } => {
+                let f = if self.snap { snap::snap_scale(free) } else { free };
+                let k = edit::axis_vec(axis.min(2));
+                if axis == 3 {
+                    Box::new(move |v| pivot.add(v.sub(pivot).scale(f)))
+                } else {
+                    Box::new(move |v| {
+                        let rel = v.sub(pivot);
+                        pivot.add(rel.add(k.scale(k.dot(rel) * (f - 1.0))))
+                    })
+                }
+            }
+            Drag::Rotate { axis, free, .. } => {
+                let a = if self.snap { snap::snap_angle(free) } else { free };
+                let k = edit::axis_vec(axis);
+                Box::new(move |v| edit::rotate_about(v, pivot, k, a))
+            }
+        };
         if let Some(mesh) = self.scene.mesh_mut() {
-            for vi in verts {
-                let v = &mut mesh.verts[vi as usize];
-                *v = apply(*v);
+            for &vi in &verts {
+                mesh.verts[vi as usize] = apply(base.verts[vi as usize]);
             }
         }
-        self.drag = Some(next_drag);
         self.rev += 1;
+    }
+
+    /// The translation to apply for a move dragged `free` along `axis`, snapped to other
+    /// visible objects' surfaces or the grid.
+    fn snapped_move(&self, base: &Mesh, verts: &std::collections::BTreeSet<u32>, axis: usize, free: f32) -> f32 {
+        let moved: Vec<V3> = verts.iter().map(|&i| base.verts[i as usize]).collect();
+        let moved_faces: Vec<Vec<V3>> = base
+            .faces
+            .iter()
+            .filter(|f| f.iter().all(|i| verts.contains(i)))
+            .map(|f| f.iter().map(|&i| base.verts[i as usize]).collect())
+            .collect();
+        let others: Vec<&Mesh> = self
+            .scene
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| *i != self.scene.active && o.visible)
+            .map(|(_, o)| &o.mesh)
+            .collect();
+        let d = self.camera.distance;
+        snap::snap_move(&moved, &moved_faces, &others, axis, free, d * 0.04, snap::grid_step(d))
+    }
+
+    pub fn set_snap(&mut self, on: bool) {
+        self.snap = on;
+    }
+
+    // ------------------------------------------------------------------ presets --
+
+    /// The visible objects as a work file (for saving a preset).
+    pub fn visible_to_bytes(&self) -> Vec<u8> {
+        let objects = self.scene.objects.iter().filter(|o| o.visible).cloned().collect();
+        Scene { objects, active: 0 }.to_bytes(&self.camera)
+    }
+
+    /// Adds every object of a saved work (a preset) to this one, where they were saved.
+    pub fn insert(&mut self, data: &[u8]) -> bool {
+        let Some((incoming, _)) = Scene::from_bytes(data) else { return false };
+        if incoming.objects.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        for o in incoming.objects {
+            let i = self.scene.add(&o.name, o.mesh);
+            self.scene.objects[i].visible = o.visible;
+        }
+        self.sel = Selection::new(self.sel.mode);
+        self.edit_mode = false;
+        self.last_op = None;
+        true
     }
 
     pub fn drag_end(&mut self) {
@@ -1140,6 +1231,37 @@ pub unsafe extern "C" fn imonder_render_export(
     let buf = std::slice::from_raw_parts_mut(out, w as usize * h as usize * 4);
     c.render_export(w as usize, h as usize, scale, view_aspect, [x0, y0, x1, y1], transparent != 0, buf);
     1
+}
+
+/// Snapping on (1) or off (0).
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_set_snap(core: *mut Core, on: i32) {
+    if let Some(c) = core.as_mut() {
+        c.set_snap(on != 0);
+    }
+}
+
+/// The visible objects as a work file, for saving a preset. Free with `imonder_free_bytes`.
+///
+/// # Safety
+/// `core` must be live and `out_len` a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_visible_bytes(core: *const Core, out_len: *mut u32) -> *mut u8 {
+    let bytes = core.as_ref().map_or_else(Vec::new, |c| c.visible_to_bytes());
+    leak_bytes(bytes, out_len)
+}
+
+/// Adds the objects of a saved work (a preset) to the current one. Returns 1 on success.
+///
+/// # Safety
+/// `core` must be live and `data` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_insert(core: *mut Core, data: *const u8, len: u32) -> i32 {
+    let (Some(c), false) = (core.as_mut(), data.is_null()) else { return 0 };
+    c.insert(std::slice::from_raw_parts(data, len as usize)) as i32
 }
 
 #[cfg(test)]
@@ -1699,6 +1821,85 @@ mod tests {
         };
         assert!(probe(Tool::Move), "red arrowhead beyond the X shaft");
         assert!(!probe(Tool::Scale), "the scale handle stops at its square");
+    }
+
+    /// A small cube hovering above a wide table; the cube is active.
+    fn table_scene() -> Core {
+        let mut c = object_core();
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x *= 4.0;
+            v.y *= 4.0;
+            v.z = v.z * 0.5 + 0.5; // table: z 0..1
+        }
+        c.add_object(0);
+        for v in &mut c.scene.mesh_mut().unwrap().verts {
+            v.x *= 0.5;
+            v.y *= 0.5;
+            v.z = v.z * 0.5 + 4.5; // cube: z 4..5
+        }
+        c
+    }
+
+    fn lowest_z(c: &Core) -> f32 {
+        c.mesh().verts.iter().map(|v| v.z).fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn snapping_drops_an_object_onto_another_and_undo_restores_it() {
+        let mut c = table_scene();
+        c.set_snap(true);
+        c.begin_transform(Drag::Move { axis: 2, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 2, free: -2.85 }); // bottom would be at 1.15
+        assert!((lowest_z(&c) - 1.0).abs() < 1e-4, "rests on the table: {}", lowest_z(&c));
+        c.apply_transform(Drag::Move { axis: 2, free: -1.0 }); // far from anything: grid
+        let z = lowest_z(&c);
+        assert!(((z / 0.1).round() * 0.1 - z).abs() < 1e-4, "on the 0.1 grid: {z}");
+        c.drag_end();
+        assert!(c.undo());
+        assert!((lowest_z(&c) - 4.0).abs() < 1e-5);
+        assert_eq!(c.status() & 1024, 1024, "undo does not change the snap setting");
+    }
+
+    #[test]
+    fn without_snapping_the_drag_is_free() {
+        let mut c = table_scene();
+        c.begin_transform(Drag::Move { axis: 2, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 2, free: -2.85 });
+        assert!((lowest_z(&c) - 1.15).abs() < 1e-4);
+    }
+
+    #[test]
+    fn snapping_rotation_and_scale_use_steps() {
+        let mut c = table_scene();
+        c.set_snap(true);
+        assert_eq!(c.status() & 1024, 1024);
+        c.begin_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: 0.0 });
+        c.apply_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: 0.3 }); // ≈17° -> 15°
+        let v = c.mesh().verts[1].sub(c.mesh().verts[0]); // the cube's bottom edge along +X
+        let angle = v.y.atan2(v.x);
+        assert!((angle - snap::ANGLE_STEP).abs() < 1e-4, "{angle}");
+        c.drag_end();
+        c.begin_transform(Drag::Scale { axis: 3, free: 1.0 });
+        c.apply_transform(Drag::Scale { axis: 3, free: 1.47 });
+        let (lo, hi) = c.mesh().bounds().unwrap();
+        assert!(((hi.z - lo.z) - 1.5).abs() < 1e-4, "1.47x snaps to 1.5x: {}", hi.z - lo.z);
+    }
+
+    #[test]
+    fn presets_save_visible_objects_and_insert_where_they_were() {
+        let mut c = table_scene();
+        c.add_object(4);
+        c.set_visible(2, false); // the sphere stays out of the preset
+        let preset = c.visible_to_bytes();
+        let mut d = object_core();
+        assert!(d.insert(&preset));
+        let names: Vec<_> = d.scene.objects.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["立方体", "立方体.001", "立方体.002"]);
+        assert_eq!(d.scene.objects[1].mesh, c.scene.objects[0].mesh, "same place as when saved");
+        assert!(d.undo(), "inserting is one undo step");
+        assert_eq!(d.scene.objects.len(), 1);
+        assert!(!d.insert(b"junk"));
+        assert_eq!(d.status() & 2, 2, "a failed insert records nothing (redo still there)");
     }
 
     #[test]
