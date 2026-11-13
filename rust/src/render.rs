@@ -179,6 +179,41 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// Filled convex polygon in screen pixels, drawn on top of everything, with soft edges.
+    fn polygon_on_top(&mut self, pts: &[(f32, f32)], col: [f32; 3]) {
+        if pts.len() < 3 {
+            return;
+        }
+        let area: f32 = (0..pts.len())
+            .map(|i| {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum();
+        let sign = if area < 0.0 { -1.0 } else { 1.0 };
+        let minx = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+        let maxx = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max).ceil().min(self.w as f32 - 1.0) as i32;
+        let miny = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+        let maxy = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil().min(self.h as f32 - 1.0) as i32;
+        for y in miny..=maxy {
+            for x in minx..=maxx {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                // Distance to the nearest edge, positive inside.
+                let mut inside = f32::MAX;
+                for i in 0..pts.len() {
+                    let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                    let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+                    let len = (ex * ex + ey * ey).sqrt().max(1e-6);
+                    inside = inside.min(sign * (ex * (py - a.1) - ey * (px - a.0)) / len);
+                }
+                let cover = (inside + 0.5).clamp(0.0, 1.0);
+                if cover > 0.0 {
+                    self.blend(x, y, f32::MIN, col, cover, false);
+                }
+            }
+        }
+    }
+
     fn dot(&mut self, c: Clip, r: f32, col: [f32; 3], alpha: f32, bias: f32) {
         if c.0[3] < 0.05 {
             return;
@@ -342,7 +377,39 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
                 for (axis, col) in AXIS_COL.iter().enumerate() {
                     let tip = clip(&vp, centre.add(crate::edit::axis_vec(axis).scale(len)));
                     f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
-                    f.dot(tip, 8.0 * scale, *col, 1.0, 4.0);
+                    // The axis direction on screen; an axis pointing at the camera has none.
+                    let head = (c0.0[3] > 0.05 && tip.0[3] > 0.05).then(|| {
+                        let (a, b) = (f.to_screen(c0), f.to_screen(tip));
+                        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                        let l = (dx * dx + dy * dy).sqrt();
+                        (l > 2.0 * scale).then_some(((b.0, b.1), (dx / l, dy / l)))
+                    });
+                    match head.flatten() {
+                        // Move: an arrowhead whose base sits on the end of the shaft.
+                        Some(((tx, ty), (dx, dy))) if style == HandleStyle::Move => {
+                            let (len_h, half_w) = (17.0 * scale, 8.0 * scale);
+                            let (px, py) = (-dy, dx);
+                            f.polygon_on_top(
+                                &[(tx + px * half_w, ty + py * half_w), (tx + dx * len_h, ty + dy * len_h), (tx - px * half_w, ty - py * half_w)],
+                                *col,
+                            );
+                        }
+                        // Scale: a small square turned along the axis.
+                        Some(((tx, ty), (dx, dy))) => {
+                            let s = 6.5 * scale;
+                            let (px, py) = (-dy, dx);
+                            f.polygon_on_top(
+                                &[
+                                    (tx + (dx + px) * s, ty + (dy + py) * s),
+                                    (tx + (dx - px) * s, ty + (dy - py) * s),
+                                    (tx + (-dx - px) * s, ty + (-dy - py) * s),
+                                    (tx + (-dx + px) * s, ty + (-dy + py) * s),
+                                ],
+                                *col,
+                            );
+                        }
+                        None => f.dot(tip, 8.0 * scale, *col, 1.0, 4.0),
+                    }
                 }
                 if style == HandleStyle::Scale {
                     f.dot(c0, 7.0 * scale, [235.0, 235.0, 240.0], 1.0, 4.0);
