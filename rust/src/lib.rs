@@ -1675,6 +1675,33 @@ mod tests {
     }
 
     #[test]
+    fn move_handles_end_in_arrowheads_and_scale_handles_in_squares() {
+        let probe = |tool: Tool| {
+            let mut c = object_core();
+            c.camera.yaw = -0.7;
+            c.camera.pitch = 0.5;
+            c.set_tool(tool);
+            let (w, h) = (400usize, 300usize);
+            let mut buf = vec![0u8; w * h * 4];
+            c.render(w, h, 1.0, &mut buf);
+            let view = c.view();
+            let (centre, len, _) = c.handle_geometry().unwrap();
+            let a = view.project(centre).unwrap();
+            let b = view.project(centre.add(edit::axis_vec(0).scale(len))).unwrap();
+            let to_px = |p: (f32, f32)| (p.0 / view.aspect * w as f32, p.1 * h as f32);
+            let (pa, pb) = (to_px((a.0, a.1)), to_px((b.0, b.1)));
+            let (dx, dy) = (pb.0 - pa.0, pb.1 - pa.1);
+            let l = (dx * dx + dy * dy).sqrt();
+            // 12 px past the end of the X shaft: inside an arrowhead, outside a 6.5 px square.
+            let (x, y) = ((pb.0 + dx / l * 12.0) as usize, (pb.1 + dy / l * 12.0) as usize);
+            let i = (y * w + x) * 4;
+            buf[i] > 200 && buf[i + 1] < 120
+        };
+        assert!(probe(Tool::Move), "red arrowhead beyond the X shaft");
+        assert!(!probe(Tool::Scale), "the scale handle stops at its square");
+    }
+
+    #[test]
     fn drag_without_handle_hit_does_nothing() {
         let mut c = front_core();
         c.tap(0.5, 0.5, false);
