@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../storage/work_store.dart';
 import '../update/update_sheet.dart';
+import 'presets.dart';
 
 /// What the gallery asks the editor to do when it closes.
 sealed class GalleryChoice {
@@ -14,7 +15,10 @@ class OpenWork extends GalleryChoice {
 }
 
 class NewWork extends GalleryChoice {
-  const NewWork();
+  const NewWork({this.presetId});
+
+  /// Start from this preset instead of the default cube.
+  final String? presetId;
 }
 
 /// The open work was deleted; the editor should start a fresh one.
@@ -28,8 +32,11 @@ String formatDate(DateTime d) {
 }
 
 class GalleryScreen extends StatefulWidget {
-  const GalleryScreen({super.key, required this.store, required this.currentId, this.updateAvailable = false});
+  const GalleryScreen({super.key, required this.store, required this.currentId, this.updateAvailable = false, this.presets});
   final WorkStore store;
+
+  /// When given (and not empty), "new" offers starting from a preset.
+  final WorkStore? presets;
   final String? currentId;
 
   /// Shows a dot on the update button.
@@ -94,6 +101,18 @@ class _GalleryScreenState extends State<GalleryScreen> {
     }
   }
 
+  Future<void> _newWork() async {
+    final presets = widget.presets;
+    if (presets == null || (await presets.list()).isEmpty) {
+      if (mounted) Navigator.pop(context, const NewWork());
+      return;
+    }
+    if (!mounted) return;
+    final choice = await pickNewWork(context, presets);
+    if (choice == null || !mounted) return;
+    Navigator.pop(context, NewWork(presetId: choice.isEmpty ? null : choice));
+  }
+
   void _openUpdates() {
     showModalBottomSheet<void>(
       context: context,
@@ -126,7 +145,7 @@ class _GalleryScreenState extends State<GalleryScreen> {
           Padding(
             padding: const EdgeInsets.only(right: 8),
             child: FilledButton.icon(
-              onPressed: () => Navigator.pop(context, const NewWork()),
+              onPressed: _newWork,
               icon: const Icon(Icons.add, size: 20),
               label: const Text('新規'),
             ),

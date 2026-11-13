@@ -7,6 +7,7 @@ import '../storage/work_store.dart';
 import '../update/updater.dart';
 import 'capture_overlay.dart';
 import 'gallery_screen.dart';
+import 'presets.dart';
 import 'view_gizmo.dart';
 import 'viewport.dart';
 
@@ -33,6 +34,8 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
   final _viewport = ModelViewportController();
   WorkStore? _store;
   WorkSession? _session;
+  WorkStore? _presets;
+  bool _snap = false;
   int _tool = 0; // 0 move, 1 rotate, 2 scale, 3 loop cut
   ReleaseInfo? _pendingUpdate;
   bool _capturing = false;
@@ -82,11 +85,13 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
 
   Future<void> _startSession() async {
     final store = await WorkStore.open();
+    final presets = await WorkStore.open(folder: 'presets');
     final session = WorkSession(store, _viewport);
     await session.start();
     if (!mounted) return;
     setState(() {
       _store = store;
+      _presets = presets;
       _session = session;
     });
   }
@@ -115,10 +120,16 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     }
   }
 
+  /// A short message floating above the bottom toolbar (never covering it).
   void _toast(String text) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(text), duration: const Duration(seconds: 2)));
+      ..showSnackBar(SnackBar(
+        content: Text(text),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        margin: EdgeInsets.fromLTRB(16, 0, 16, MediaQuery.paddingOf(context).bottom + 84),
+      ));
   }
 
   // ------------------------------------------------------------------- gallery --
@@ -130,13 +141,21 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
     if (!mounted) return;
     final choice = await Navigator.of(context).push<GalleryChoice>(
       MaterialPageRoute(
-        builder: (_) => GalleryScreen(store: store, currentId: session.id, updateAvailable: _pendingUpdate != null),
+        builder: (_) => GalleryScreen(
+          store: store,
+          currentId: session.id,
+          updateAvailable: _pendingUpdate != null,
+          presets: _presets,
+        ),
       ),
     );
     switch (choice) {
       case OpenWork(:final id):
         if (!await session.open(id)) _toast('この作品を開けませんでした');
-      case NewWork() || CurrentDeleted():
+      case NewWork(:final presetId):
+        final from = presetId == null ? null : await _presets?.load(presetId);
+        await session.createNew(from: from);
+      case CurrentDeleted():
         await session.createNew();
       case null:
         break;
@@ -146,42 +165,81 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
   // ------------------------------------------------------------------- objects --
 
   void _showAddSheet() {
+    final presets = _presets;
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
       backgroundColor: const Color(0xFF252528),
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
       builder: (ctx) => SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
-          child: GridView.count(
-            shrinkWrap: true,
-            crossAxisCount: 3,
-            mainAxisSpacing: 10,
-            crossAxisSpacing: 10,
-            childAspectRatio: 1.35,
-            children: [
-              for (var i = 0; i < _primitives.length; i++)
-                Material(
-                  color: const Color(0xFF303034),
-                  borderRadius: BorderRadius.circular(16),
-                  child: InkWell(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            GridView.count(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              crossAxisCount: 3,
+              mainAxisSpacing: 10,
+              crossAxisSpacing: 10,
+              childAspectRatio: 1.35,
+              children: [
+                for (var i = 0; i < _primitives.length; i++)
+                  Material(
+                    color: const Color(0xFF303034),
                     borderRadius: BorderRadius.circular(16),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _viewport.addObject(i);
-                    },
-                    child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                      Icon(_primitives[i].$1, color: const Color(0xFFD4D4D9)),
-                      const SizedBox(height: 6),
-                      Text(_primitives[i].$2, style: const TextStyle(fontSize: 13)),
-                    ]),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(16),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _viewport.addObject(i);
+                      },
+                      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                        Icon(_primitives[i].$1, color: const Color(0xFFD4D4D9)),
+                        const SizedBox(height: 6),
+                        Text(_primitives[i].$2, style: const TextStyle(fontSize: 13)),
+                      ]),
+                    ),
                   ),
-                ),
+              ],
+            ),
+            if (presets != null) ...[
+              const SizedBox(height: 18),
+              const Text('プリセット', style: TextStyle(fontSize: 13, color: _muted)),
+              const SizedBox(height: 8),
+              PresetStrip(
+                store: presets,
+                onPick: (w) async {
+                  Navigator.pop(ctx);
+                  final bytes = await presets.load(w.id);
+                  if (bytes == null || !_viewport.insertPreset(bytes)) {
+                    _toast('プリセットを読み込めませんでした');
+                  }
+                },
+              ),
             ],
-          ),
+          ]),
         ),
       ),
     );
+  }
+
+  /// Saves the visible objects as a preset.
+  Future<void> _savePreset() async {
+    final presets = _presets;
+    final bytes = _viewport.presetBytes();
+    if (presets == null || bytes == null) return;
+    if (!_viewport.objects().any((o) => o.visible)) {
+      _toast('表示中のオブジェクトがありません');
+      return;
+    }
+    final count = (await presets.list()).length;
+    if (!mounted) return;
+    final name = await askName(context, title: '表示中のオブジェクトをプリセットに登録', initial: 'プリセット ${count + 1}');
+    if (name == null) return;
+    final thumb = await _viewport.thumbnailPng();
+    final id = await presets.create(name: name);
+    await presets.save(id, bytes, thumbnailPng: thumb);
+    _toast('「$name」をプリセットに登録しました');
   }
 
   void _showOutliner() {
@@ -200,6 +258,14 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
               Row(children: [
                 const SizedBox(width: 20),
                 const Expanded(child: Text('シーン', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600))),
+                IconButton(
+                  tooltip: 'プリセットに登録',
+                  icon: const Icon(Icons.bookmark_add_outlined),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _savePreset();
+                  },
+                ),
                 IconButton(
                   tooltip: 'オブジェクトを追加',
                   icon: const Icon(Icons.add),
@@ -403,6 +469,26 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
         _iconBtn(Icons.grid_view, _pendingUpdate != null ? 'ギャラリー（アップデートがあります）' : 'ギャラリー',
             _session == null ? null : _openGallery, dot: _pendingUpdate != null),
         _iconBtn(Icons.photo_camera_outlined, '撮影', () => setState(() => _capturing = true), color: const Color(0xFFD4D4D9)),
+        Semantics(
+          button: true,
+          toggled: _snap,
+          label: 'スナップ',
+          child: SizedBox(
+            width: 44,
+            height: 44,
+            child: IconButton(
+              tooltip: _snap ? 'スナップ：オン' : 'スナップ：オフ',
+              padding: EdgeInsets.zero,
+              style: _snap ? IconButton.styleFrom(backgroundColor: accent.withValues(alpha: 0.2)) : null,
+              onPressed: () {
+                setState(() => _snap = !_snap);
+                _viewport.setSnap(_snap);
+                _toast(_snap ? 'スナップ：面・グリッドに吸着／回転15°／拡大0.1倍刻み' : 'スナップをオフにしました');
+              },
+              icon: MagnetIcon(color: _snap ? accent : _muted),
+            ),
+          ),
+        ),
         const Spacer(),
         _iconBtn(Icons.layers_outlined, 'シーン', _showOutliner, color: _muted),
         _iconBtn(Icons.hub_outlined, editMode ? '編集モード' : 'オブジェクトモード', () => _toggleMode(status), color: editMode ? accent : _muted),

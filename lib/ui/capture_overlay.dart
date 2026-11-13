@@ -78,7 +78,13 @@ class _CaptureOverlayState extends State<CaptureOverlay> {
   void _toast(String text) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(text), duration: const Duration(seconds: 3)));
+      ..showSnackBar(SnackBar(
+        content: Text(text),
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
+        // Above the capture panel, so it never covers the controls.
+        margin: EdgeInsets.fromLTRB(16, 0, 16, MediaQuery.paddingOf(context).bottom + 212),
+      ));
   }
 
   static Future<void> _toGallery(Uint8List png, String name) async {
