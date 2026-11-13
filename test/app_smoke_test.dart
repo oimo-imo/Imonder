@@ -181,6 +181,47 @@ void main() {
     await settle(tester, rounds: 30);
   }, skip: skip);
 
+  testWidgets('multi-select from the toolbar, grouping shown in the scene list', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(const MaterialApp(home: EditorScreen()));
+    await settle(tester);
+    await tester.tap(find.byTooltip('追加'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('球'));
+    await settle(tester, rounds: 10);
+
+    await tester.tap(find.byTooltip('グループ化'));
+    await settle(tester, rounds: 10);
+    expect(find.textContaining('2つ以上のオブジェクトを選んでください'), findsOneWidget);
+    await tester.tap(find.byTooltip('全選択'));
+    await settle(tester, rounds: 10);
+    await tester.tap(find.byTooltip('グループ化'));
+    await settle(tester, rounds: 10);
+    expect(find.byTooltip('グループ解除'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('シーン'));
+    await tester.pumpAndSettle();
+    expect(find.text('グループ 1'), findsNWidgets(2));
+    expect(tester.widgetList<Checkbox>(find.byType(Checkbox)).every((c) => c.value == true), isTrue);
+    // Unticking one member takes the whole group out of the selection.
+    await tester.tap(find.byType(Checkbox).first);
+    await tester.pumpAndSettle();
+    expect(tester.widgetList<Checkbox>(find.byType(Checkbox)).every((c) => c.value == false), isTrue);
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+
+    // The add-select toggle lights up.
+    await tester.tap(find.byTooltip('追加選択'));
+    await settle(tester, rounds: 10);
+    final button = tester.widget<IconButton>(find.ancestor(of: find.byIcon(Icons.library_add_check_outlined), matching: find.byType(IconButton)));
+    expect(button.style, isNotNull, reason: 'highlighted while on');
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
   testWidgets('the gallery lists works and reports what was chosen', (tester) async {
     final store = WorkStore(Directory('${docs.path}/w')..createSync());
     final a = await tester.runAsync(() => store.create(name: 'ねこ'));

@@ -88,6 +88,18 @@ class ModelViewportController {
   void duplicateObject() => _run((c) => c.duplicateObject());
   void deleteObject() => _run((c) => c.deleteObject());
   void selectObject(int index) => _run((c) => c.selectObject(index));
+  void toggleObject(int index) => _run((c) => c.toggleObject(index));
+  void selectAllObjects() => _run((c) => c.selectAllObjects());
+
+  /// Groups (true) or ungroups (false) the selected objects; false if nothing changed.
+  bool groupObjects(bool on) {
+    var ok = false;
+    _run((c) => ok = c.groupObjects(on));
+    return ok;
+  }
+
+  /// When on, taps add to (or take from) the selection instead of replacing it.
+  bool addSelect = false;
   void setObjectVisible(int index, bool visible) => _run((c) => c.setVisible(index, visible));
 
   void _run(void Function(NativeCore) f) {
@@ -368,7 +380,7 @@ class _ViewportState extends State<ModelViewport> {
     } else if (quick) {
       if (_maxPointers == 1 && _primaryButton) {
         final n = _norm(_lastUp);
-        _core.tap(n.dx, n.dy, add: HardwareKeyboard.instance.isShiftPressed);
+        _core.tap(n.dx, n.dy, add: HardwareKeyboard.instance.isShiftPressed || (widget.controller?.addSelect ?? false));
         _changed();
       } else if (_maxPointers == 2 && !(widget.controller?.capturing ?? false)) {
         widget.controller?.undo();

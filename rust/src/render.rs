@@ -255,6 +255,8 @@ pub struct Scene<'a> {
     pub edit: Option<EditOverlay<'a>>,
     /// Transform handles: centre, world length and style, if they should be drawn.
     pub handles: Option<(V3, f32, HandleStyle)>,
+    /// Outline the selected objects (object mode).
+    pub highlight: bool,
 }
 
 const ACCENT: [f32; 3] = [242.0, 163.0, 94.0]; // #F2A35E
@@ -301,6 +303,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
         continue;
     }
     let mesh = &obj.mesh;
+    let outlined = scene.highlight && obj.selected;
     let is_active = oi == scene.active;
     for (fi, face) in mesh.faces.iter().enumerate() {
         if face.len() < 3 {
@@ -348,8 +351,9 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
         for k in 0..face.len() {
             let a = clip(&vp, mesh.verts[face[k] as usize]);
             let b = clip(&vp, mesh.verts[face[(k + 1) % face.len()] as usize]);
-            if is_active && scene.edit.is_none() {
-                f.line(a, b, ACCENT, 1.0, 2.2 * scale, line_bias * 1.5);
+            if outlined {
+                // The active object a little bolder than the rest of the selection.
+                f.line(a, b, ACCENT, 1.0, if is_active { 2.4 } else { 1.7 } * scale, line_bias * 1.5);
             } else if opts.edges {
                 f.line(a, b, [42.0, 42.0, 46.0], 0.9, 1.4 * scale, line_bias);
             }

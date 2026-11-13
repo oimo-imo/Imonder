@@ -32,10 +32,14 @@ typedef _Export = int Function(Pointer<Void>, int, int, double, double, double, 
 
 /// One entry of the scene list.
 class SceneObject {
-  const SceneObject(this.name, this.visible, this.active);
+  const SceneObject(this.name, this.visible, this.active, {this.selected = false, this.group = 0});
   final String name;
   final bool visible;
   final bool active;
+  final bool selected;
+
+  /// Objects with the same non-zero group are selected together.
+  final int group;
 }
 typedef _Render = int Function(Pointer<Void>, int, int, double, Pointer<Uint8>);
 
@@ -99,6 +103,9 @@ class NativeCore {
     _setSnap = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_snap');
     _visibleBytes = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_visible_bytes');
     _insert = l.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint8>, Uint32), _Load>('imonder_insert');
+    _toggleObject = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_toggle_object');
+    _selectAllObjects = l.lookupFunction<Void Function(Pointer<Void>), _Void>('imonder_select_all_objects');
+    _groupObjects = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_group_objects');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -148,6 +155,9 @@ class NativeCore {
   late final _Flag _setSnap;
   late final _Bytes _visibleBytes;
   late final _Load _insert;
+  late final _Op _toggleObject;
+  late final _Void _selectAllObjects;
+  late final _Op _groupObjects;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -231,6 +241,13 @@ class NativeCore {
   bool duplicateObject() => _duplicateObject(_handle) == 1;
   bool deleteObject() => _deleteObject(_handle) == 1;
   bool selectObject(int index) => _selectObject(_handle, index) == 1;
+  /// Adds the object (and its group) to the selection, or takes it out.
+  bool toggleObject(int index) => _toggleObject(_handle, index) == 1;
+  void selectAllObjects() => _selectAllObjects(_handle);
+
+  /// Groups (true) or ungroups (false) the selected objects; false if nothing changed.
+  bool groupObjects(bool on) => _groupObjects(_handle, on ? 1 : 0) == 1;
+
   bool setVisible(int index, bool visible) => _setVisible(_handle, index, visible ? 1 : 0) == 1;
 
   Uint8List _takeBytes(Pointer<Uint8> p, Pointer<Uint32> len) {
@@ -245,7 +262,11 @@ class NativeCore {
     try {
       final bytes = _takeBytes(_sceneJson(_handle, len), len);
       final list = jsonDecode(utf8.decode(bytes)) as List<dynamic>;
-      return [for (final o in list) SceneObject(o['name'] as String, o['visible'] as bool, o['active'] as bool)];
+      return [
+        for (final o in list)
+          SceneObject(o['name'] as String, o['visible'] as bool, o['active'] as bool,
+              selected: o['selected'] as bool, group: o['group'] as int),
+      ];
     } finally {
       malloc.free(len);
     }

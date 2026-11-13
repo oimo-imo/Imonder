@@ -120,4 +120,29 @@ void main() {
     expect(core.status() & 256, 256);
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
+
+  test('multi-select and groups', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    core.addObject(4);
+    core.addObject(2);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['円柱'], reason: 'a new object is the selection');
+    expect(core.toggleObject(0), isTrue);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['立方体', '円柱']);
+    expect(core.status() & 2048, 2048);
+    expect(core.groupObjects(true), isTrue);
+    expect(core.objects().map((o) => o.group), [1, 0, 1]);
+    expect(core.selectObject(1), isTrue);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['球']);
+    expect(core.selectObject(2), isTrue);
+    expect(core.objects().where((o) => o.selected).map((o) => o.name), ['立方体', '円柱'], reason: 'group');
+    core.selectAllObjects();
+    expect(core.objects().every((o) => o.selected), isTrue);
+    expect(core.groupObjects(false), isTrue);
+    expect(core.objects().map((o) => o.group), [0, 0, 0]);
+    expect(core.duplicateObject(), isTrue);
+    expect(core.objects().length, 6);
+    expect(core.deleteObject(), isTrue);
+    expect(core.objects().length, 3);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
 }

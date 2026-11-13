@@ -168,30 +168,49 @@ impl Core {
     }
 
     /// Vertices a transform acts on: the selection in edit mode, the whole active object otherwise.
-    fn transform_verts(&self) -> std::collections::BTreeSet<u32> {
+    /// What a transform moves: (object index, its vertices). The element selection of the
+    /// active object in edit mode; every selected object, whole, in object mode.
+    fn transform_targets(&self) -> Vec<(usize, std::collections::BTreeSet<u32>)> {
         if self.edit_mode {
-            self.sel.affected_verts(self.mesh())
+            if !self.scene.has_active() {
+                return Vec::new();
+            }
+            let v = self.sel.affected_verts(self.mesh());
+            if v.is_empty() {
+                return Vec::new();
+            }
+            vec![(self.scene.active, v)]
         } else {
-            (0..self.mesh().verts.len() as u32).collect()
+            self.scene
+                .selected_indices()
+                .into_iter()
+                .map(|i| (i, (0..self.scene.objects[i].mesh.verts.len() as u32).collect()))
+                .filter(|(_, v): &(usize, std::collections::BTreeSet<u32>)| !v.is_empty())
+                .collect()
+        }
+    }
+
+    /// Pivot of the targets in `scene`: the centroid of the selected elements in edit mode,
+    /// the centre of the selected objects' bounds in object mode.
+    fn pivot_in(&self, scene: &Scene, targets: &[(usize, std::collections::BTreeSet<u32>)]) -> Option<V3> {
+        if self.edit_mode {
+            let (oi, verts) = targets.first()?;
+            let mesh = &scene.objects.get(*oi)?.mesh;
+            let sum = verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(mesh.verts[i as usize]));
+            Some(sum.scale(1.0 / verts.len() as f32))
+        } else {
+            let (lo, hi) = scene.selection_bounds()?;
+            Some(lo.add(hi).scale(0.5))
         }
     }
 
     fn handle_geometry(&self) -> Option<(V3, f32, render::HandleStyle)> {
         let style = self.handle_style()?;
-        if !self.scene.has_active() {
+        let targets = self.transform_targets();
+        if targets.is_empty() {
             return None;
         }
-        let verts = self.transform_verts();
-        if verts.is_empty() {
-            return None;
-        }
-        let mesh = self.mesh();
-        let centre = if self.edit_mode {
-            let sum = verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(mesh.verts[i as usize]));
-            sum.scale(1.0 / verts.len() as f32)
-        } else {
-            self.scene.bounds_centre()?
-        };
+        let centre = self.pivot_in(&self.scene, &targets)?;
         Some((centre, self.camera.distance * 0.18, style))
     }
 
@@ -207,13 +226,14 @@ impl Core {
             active: self.scene.active,
             edit: self.edit_mode.then(|| render::EditOverlay { sel: &self.sel }),
             handles: self.handle_geometry(),
+            highlight: !self.edit_mode,
         };
         render::render_scene(&scene, &self.camera, w, h, scale, out, &render::RenderOpts::default());
     }
 
     /// The models only: no selection, handles or highlight.
     fn clean_scene(&self) -> render::Scene<'_> {
-        render::Scene { objects: &self.scene.objects, active: usize::MAX, edit: None, handles: None }
+        render::Scene { objects: &self.scene.objects, active: usize::MAX, edit: None, handles: None, highlight: false }
     }
 
     // ------------------------------------------------------------------ capture --
@@ -379,7 +399,16 @@ impl Core {
                 .filter_map(|(i, o)| edit::pick_face(&o.mesh, &view, p).map(|(_, z)| (i, z)))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             self.sel = Selection::new(self.sel.mode);
-            self.scene.active = hit.map_or(self.scene.objects.len(), |(i, _)| i);
+            match (hit, add) {
+                (Some((i, _)), true) => {
+                    self.scene.toggle(i);
+                }
+                (Some((i, _)), false) => {
+                    self.scene.select_only(i);
+                }
+                (None, true) => {}
+                (None, false) => self.scene.clear_selection(),
+            }
             return hit.is_some();
         }
         if self.tool == Tool::LoopCut {
@@ -442,7 +471,8 @@ impl Core {
 
     /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected,
     /// bit 3: an adjustable operation is active, bits 4-5: select mode (0 vertex, 1 edge, 2 face),
-    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode, bit 10: snapping.
+    /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode, bit 10: snapping, bit 11: two or more objects selected,
+    /// bit 12: a selected object is in a group.
     pub fn status(&self) -> i32 {
         (!self.undo.is_empty()) as i32
             | ((!self.redo.is_empty()) as i32) << 1
@@ -458,6 +488,8 @@ impl Core {
             | (self.camera.ortho as i32) << 8
             | (self.capture.is_some() as i32) << 9
             | (self.snap as i32) << 10
+            | ((self.scene.selected_indices().len() >= 2) as i32) << 11
+            | (self.scene.objects.iter().any(|o| o.selected && o.group != 0) as i32) << 12
     }
 
     // -------------------------------------------------------------------- objects --
@@ -469,45 +501,77 @@ impl Core {
         for v in &mut mesh.verts {
             *v = v.add(self.camera.target);
         }
-        self.scene.add(name, mesh);
+        let i = self.scene.add(name, mesh);
+        self.scene.select_only(i);
         self.sel = Selection::new(self.sel.mode);
         self.edit_mode = false;
         self.last_op = None;
         true
     }
 
+    /// Copies every selected object in place; the copies become the selection.
     pub fn duplicate_object(&mut self) -> bool {
-        if !self.scene.has_active() {
+        if self.scene.selected_indices().is_empty() {
             return false;
         }
         self.push_undo();
         self.sel = Selection::new(self.sel.mode);
+        self.edit_mode = false;
         self.last_op = None;
-        self.scene.duplicate_active()
+        self.scene.duplicate_selected()
     }
 
+    /// Deletes every selected object.
     pub fn delete_object(&mut self) -> bool {
-        if !self.scene.has_active() {
+        if self.scene.selected_indices().is_empty() {
             return false;
         }
         self.push_undo();
         self.edit_mode = false;
         self.sel = Selection::new(self.sel.mode);
         self.last_op = None;
-        self.scene.remove_active();
-        true
+        self.scene.remove_selected()
     }
 
+    /// Selects only this object (and its group), e.g. from the scene list.
     pub fn select_object(&mut self, index: usize) -> bool {
         if index >= self.scene.objects.len() {
             return false;
         }
         if self.scene.active != index {
-            self.scene.active = index;
             self.sel = Selection::new(self.sel.mode);
             self.edit_mode = false;
             self.last_op = None;
         }
+        self.scene.select_only(index)
+    }
+
+    /// Adds the object (and its group) to the selection or takes it out.
+    pub fn toggle_object(&mut self, index: usize) -> bool {
+        if index >= self.scene.objects.len() {
+            return false;
+        }
+        self.sel = Selection::new(self.sel.mode);
+        self.edit_mode = false;
+        self.last_op = None;
+        self.scene.toggle(index)
+    }
+
+    pub fn select_all_objects(&mut self) {
+        self.edit_mode = false;
+        self.last_op = None;
+        self.scene.select_all_visible();
+    }
+
+    /// Groups (`on`) or ungroups the selected objects. One undo step.
+    pub fn group_objects(&mut self, on: bool) -> bool {
+        let mut probe = self.scene.clone();
+        let changed = if on { probe.group_selected() } else { probe.ungroup_selected() };
+        if !changed {
+            return false;
+        }
+        self.push_undo();
+        self.scene = probe;
         true
     }
 
@@ -674,19 +738,17 @@ impl Core {
     /// Sets the moving vertices to their starting positions transformed by the drag so far
     /// (snapped when snapping is on).
     fn apply_transform(&mut self, drag: Drag) {
-        let Some(base) = self.undo.last().map(|s| s.scene.mesh().clone()) else { return };
-        let verts = self.transform_verts();
-        if verts.is_empty() || base.verts.len() != self.mesh().verts.len() {
+        let Some(base) = self.undo.last().map(|s| s.scene.clone()) else { return };
+        let targets = self.transform_targets();
+        if targets.is_empty()
+            || targets.iter().any(|(oi, _)| base.objects.get(*oi).map(|o| o.mesh.verts.len()) != self.scene.objects.get(*oi).map(|o| o.mesh.verts.len()))
+        {
             return;
         }
-        let pivot = if self.edit_mode {
-            verts.iter().fold(math::v3(0.0, 0.0, 0.0), |s, &i| s.add(base.verts[i as usize])).scale(1.0 / verts.len() as f32)
-        } else {
-            base.bounds().map_or(math::v3(0.0, 0.0, 0.0), |(lo, hi)| lo.add(hi).scale(0.5))
-        };
+        let Some(pivot) = self.pivot_in(&base, &targets) else { return };
         let apply: Box<dyn Fn(V3) -> V3> = match drag {
             Drag::Move { axis, free } => {
-                let t = if self.snap { self.snapped_move(&base, &verts, axis, free) } else { free };
+                let t = if self.snap { self.snapped_move(&base, &targets, axis, free) } else { free };
                 let dir = edit::axis_vec(axis);
                 Box::new(move |v| v.add(dir.scale(t)))
             }
@@ -708,30 +770,37 @@ impl Core {
                 Box::new(move |v| edit::rotate_about(v, pivot, k, a))
             }
         };
-        if let Some(mesh) = self.scene.mesh_mut() {
-            for &vi in &verts {
-                mesh.verts[vi as usize] = apply(base.verts[vi as usize]);
+        for (oi, verts) in &targets {
+            let from = &base.objects[*oi].mesh;
+            let to = &mut self.scene.objects[*oi].mesh;
+            for &vi in verts {
+                to.verts[vi as usize] = apply(from.verts[vi as usize]);
             }
         }
         self.rev += 1;
     }
 
-    /// The translation to apply for a move dragged `free` along `axis`, snapped to other
-    /// visible objects' surfaces or the grid.
-    fn snapped_move(&self, base: &Mesh, verts: &std::collections::BTreeSet<u32>, axis: usize, free: f32) -> f32 {
-        let moved: Vec<V3> = verts.iter().map(|&i| base.verts[i as usize]).collect();
-        let moved_faces: Vec<Vec<V3>> = base
-            .faces
-            .iter()
-            .filter(|f| f.iter().all(|i| verts.contains(i)))
-            .map(|f| f.iter().map(|&i| base.verts[i as usize]).collect())
-            .collect();
-        let others: Vec<&Mesh> = self
-            .scene
+    /// The translation to apply for a move dragged `free` along `axis`, snapped to the
+    /// surfaces of the visible objects that are not moving, or to the grid.
+    fn snapped_move(&self, base: &Scene, targets: &[(usize, std::collections::BTreeSet<u32>)], axis: usize, free: f32) -> f32 {
+        let mut moved: Vec<V3> = Vec::new();
+        let mut moved_faces: Vec<Vec<V3>> = Vec::new();
+        for (oi, verts) in targets {
+            let mesh = &base.objects[*oi].mesh;
+            moved.extend(verts.iter().map(|&i| mesh.verts[i as usize]));
+            moved_faces.extend(
+                mesh.faces
+                    .iter()
+                    .filter(|f| f.iter().all(|i| verts.contains(i)))
+                    .map(|f| f.iter().map(|&i| mesh.verts[i as usize]).collect()),
+            );
+        }
+        let moving: std::collections::BTreeSet<usize> = targets.iter().map(|(i, _)| *i).collect();
+        let others: Vec<&Mesh> = base
             .objects
             .iter()
             .enumerate()
-            .filter(|(i, o)| *i != self.scene.active && o.visible)
+            .filter(|(i, o)| !moving.contains(i) && o.visible)
             .map(|(_, o)| &o.mesh)
             .collect();
         let d = self.camera.distance;
@@ -746,7 +815,13 @@ impl Core {
 
     /// The visible objects as a work file (for saving a preset).
     pub fn visible_to_bytes(&self) -> Vec<u8> {
-        let objects = self.scene.objects.iter().filter(|o| o.visible).cloned().collect();
+        let objects = self
+            .scene
+            .objects
+            .iter()
+            .filter(|o| o.visible)
+            .map(|o| scene::Object { selected: false, group: 0, ..o.clone() })
+            .collect();
         Scene { objects, active: 0 }.to_bytes(&self.camera)
     }
 
@@ -757,10 +832,14 @@ impl Core {
             return false;
         }
         self.push_undo();
+        self.scene.clear_selection();
         for o in incoming.objects {
             let i = self.scene.add(&o.name, o.mesh);
             self.scene.objects[i].visible = o.visible;
+            self.scene.objects[i].selected = true;
         }
+        // The pieces of a preset move together.
+        self.scene.group_selected();
         self.sel = Selection::new(self.sel.mode);
         self.edit_mode = false;
         self.last_op = None;
@@ -1264,6 +1343,35 @@ pub unsafe extern "C" fn imonder_insert(core: *mut Core, data: *const u8, len: u
     c.insert(std::slice::from_raw_parts(data, len as usize)) as i32
 }
 
+/// Adds the object (and its group) to the selection, or takes it out.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_toggle_object(core: *mut Core, index: i32) -> i32 {
+    core.as_mut().map_or(0, |c| (index >= 0 && c.toggle_object(index as usize)) as i32)
+}
+
+/// Selects every visible object.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_select_all_objects(core: *mut Core) {
+    if let Some(c) = core.as_mut() {
+        c.select_all_objects();
+    }
+}
+
+/// Groups (1) or ungroups (0) the selected objects. Returns 1 if anything changed.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_group_objects(core: *mut Core, on: i32) -> i32 {
+    core.as_mut().map_or(0, |c| c.group_objects(on != 0) as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,7 +1665,7 @@ mod tests {
     fn object_mode_transform_moves_only_the_active_object() {
         let mut c = object_core();
         c.add_object(4);
-        c.scene.active = 0;
+        c.select_object(0);
         let before: Vec<_> = c.scene.objects.iter().map(|o| o.mesh.verts.clone()).collect();
         let view = c.view();
         let (centre, len, _) = c.handle_geometry().unwrap();
@@ -1581,6 +1689,8 @@ mod tests {
         assert!(!c.scene.objects[1].visible);
         assert!(c.delete_object());
         assert_eq!(c.scene.objects.len(), 1);
+        assert!(!c.delete_object(), "nothing is selected after deleting");
+        c.select_object(0);
         assert!(c.delete_object() && !c.delete_object());
         assert!(!c.scene.has_active());
         c.set_edit_mode(true);
@@ -1900,6 +2010,117 @@ mod tests {
         assert_eq!(d.scene.objects.len(), 1);
         assert!(!d.insert(b"junk"));
         assert_eq!(d.status() & 2, 2, "a failed insert records nothing (redo still there)");
+    }
+
+    /// Cube at the origin, a sphere to its right and a cone further right, front view.
+    fn three_objects() -> Core {
+        let mut c = object_core();
+        c.camera.distance = 14.0;
+        for (kind, dx) in [(4, 3.0), (3, 6.0)] {
+            c.add_object(kind);
+            for v in &mut c.scene.mesh_mut().unwrap().verts {
+                v.x += dx;
+            }
+        }
+        c.camera.target = math::v3(3.0, 0.0, 0.0);
+        let mut buf = vec![0u8; 400 * 300 * 4];
+        c.render(400, 300, 1.0, &mut buf);
+        c
+    }
+
+    fn tap_object(c: &mut Core, i: usize, add: bool) -> bool {
+        let view = c.view();
+        let (lo, hi) = c.scene.objects[i].mesh.bounds().unwrap();
+        let p = view.project(lo.add(hi).scale(0.5)).unwrap();
+        c.tap(p.0 / view.aspect, p.1, add)
+    }
+
+    #[test]
+    fn add_select_by_tap_then_move_all_selected_together() {
+        let mut c = three_objects();
+        assert!(tap_object(&mut c, 0, false));
+        assert!(tap_object(&mut c, 2, true));
+        assert_eq!(c.scene.selected_indices(), vec![0, 2]);
+        assert_eq!(c.status() & 2048, 2048, "two or more selected");
+        let before: Vec<_> = c.scene.objects.iter().map(|o| o.mesh.verts.clone()).collect();
+        c.begin_transform(Drag::Move { axis: 2, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 2, free: 1.5 });
+        c.drag_end();
+        for i in [0, 2] {
+            assert!(c.scene.objects[i].mesh.verts.iter().zip(&before[i]).all(|(a, b)| (a.z - b.z - 1.5).abs() < 1e-5));
+        }
+        assert_eq!(c.scene.objects[1].mesh.verts, before[1], "the unselected sphere stays");
+        // Tapping a selected object with "add" takes it out again.
+        assert!(tap_object(&mut c, 2, true));
+        assert_eq!(c.scene.selected_indices(), vec![0]);
+        // Tapping empty space with "add" keeps the selection; without it clears it.
+        assert!(!c.tap(0.01, 0.01, true));
+        assert_eq!(c.scene.selected_indices(), vec![0]);
+        assert!(!c.tap(0.01, 0.01, false));
+        assert!(c.scene.selected_indices().is_empty());
+    }
+
+    #[test]
+    fn rotation_of_a_selection_turns_around_its_common_centre() {
+        let mut c = three_objects();
+        c.select_all_objects();
+        let (lo, hi) = c.scene.selection_bounds().unwrap();
+        let centre = lo.add(hi).scale(0.5);
+        c.begin_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: 0.0 });
+        c.apply_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: std::f32::consts::PI });
+        let (lo2, hi2) = c.scene.selection_bounds().unwrap();
+        assert!(lo2.add(hi2).scale(0.5).sub(centre).len() < 1e-3, "half a turn keeps the centre");
+        let (sl, sh) = c.scene.objects[1].mesh.bounds().unwrap(); // the sphere in the middle stays in the middle
+        assert!((sl.add(sh).scale(0.5).x - centre.x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn groups_select_as_one_and_duplicate_and_delete_together() {
+        let mut c = three_objects();
+        c.select_object(0);
+        c.toggle_object(1);
+        assert!(c.group_objects(true));
+        assert_eq!(c.status() & 4096, 4096);
+        assert!(tap_object(&mut c, 2, false));
+        assert!(tap_object(&mut c, 1, false));
+        assert_eq!(c.scene.selected_indices(), vec![0, 1], "one tap selects the whole group");
+        assert!(c.duplicate_object());
+        assert_eq!(c.scene.objects.len(), 5);
+        assert_eq!(c.scene.selected_indices(), vec![3, 4]);
+        assert!(c.delete_object());
+        assert_eq!(c.scene.objects.len(), 3);
+        assert!(c.undo() && c.undo());
+        assert_eq!(c.scene.objects.len(), 3);
+        assert!(c.scene.objects.iter().all(|o| o.group == 1 || o.name == "円錐"), "back to grouped");
+        c.select_object(0);
+        assert!(c.group_objects(false));
+        c.select_object(0);
+        assert_eq!(c.scene.selected_indices(), vec![0]);
+        assert!(!c.group_objects(false), "nothing to ungroup");
+    }
+
+    #[test]
+    fn an_inserted_preset_arrives_selected_as_one_group() {
+        let src = three_objects();
+        let preset = src.visible_to_bytes();
+        let mut c = object_core();
+        assert!(c.insert(&preset));
+        assert_eq!(c.scene.selected_indices(), vec![1, 2, 3]);
+        let g = c.scene.objects[1].group;
+        assert!(g != 0 && c.scene.objects[1..].iter().all(|o| o.group == g));
+        assert_eq!(c.scene.objects[0].group, 0);
+    }
+
+    #[test]
+    fn selection_and_groups_survive_saving() {
+        let mut c = three_objects();
+        c.select_object(0);
+        c.toggle_object(2);
+        c.group_objects(true);
+        let mut d = Core::new();
+        assert!(d.load(&c.to_bytes()));
+        assert_eq!(d.scene.selected_indices(), vec![0, 2]);
+        assert_eq!(d.scene.objects.iter().map(|o| o.group).collect::<Vec<_>>(), vec![1, 0, 1]);
     }
 
     #[test]
