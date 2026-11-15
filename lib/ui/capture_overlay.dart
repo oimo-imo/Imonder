@@ -3,6 +3,9 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
 
+import '../core/native_core.dart';
+import 'presets.dart';
+import 'views_sheet.dart';
 import 'viewport.dart';
 
 const _panel = Color(0xFF252528);
@@ -103,12 +106,40 @@ class _CaptureOverlayState extends State<CaptureOverlay> {
       String two(int n) => n.toString().padLeft(2, '0');
       final name = 'imonder_${now.year}${two(now.month)}${two(now.day)}_${two(now.hour)}${two(now.minute)}${two(now.second)}';
       await (widget.saveImage ?? _toGallery)(png, name);
+      // Remember where this was shot from, to shoot again from the same place later.
+      _vp.viewSave(lastShotName, aspect: captureAspects[_aspect].$2, replace: true);
       _toast('写真に保存しました（$name.png）');
     } catch (e) {
       _toast('保存できませんでした: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// Saved views with their indices, "the last shot" first.
+  List<(int, SavedViewInfo)> _orderedViews() {
+    final all = _vp.views().indexed.toList();
+    all.sort((a, b) => (b.$2.name == lastShotName ? 1 : 0) - (a.$2.name == lastShotName ? 1 : 0));
+    return all;
+  }
+
+  /// Jumps to a saved view, restoring the frame shape it was shot with.
+  void _goTo(int i) {
+    final aspect = _vp.viewApply(i);
+    setState(() {
+      _preset = null;
+      if (aspect != null && aspect > 0) {
+        final match = captureAspects.indexWhere((a) => (a.$2 - aspect).abs() < 0.01);
+        if (match >= 0) _aspect = match;
+      }
+    });
+  }
+
+  Future<void> _saveView() async {
+    final name = await askName(context, title: '今の視点を保存', initial: '視点 ${_vp.views().length + 1}');
+    if (name == null) return;
+    _vp.viewSave(name, aspect: captureAspects[_aspect].$2);
+    setState(() {});
   }
 
   @override
@@ -161,8 +192,10 @@ class _CaptureOverlayState extends State<CaptureOverlay> {
     );
   }
 
-  Widget _row(List<Widget> children) =>
-      SizedBox(height: 48, child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: children));
+  Widget _row(List<Widget> children, {Key? key}) => SizedBox(
+      key: key,
+      height: 48,
+      child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: children));
 
   Widget _panelWidget(EdgeInsets pad, Color accent, double height) {
     return Container(
@@ -171,13 +204,17 @@ class _CaptureOverlayState extends State<CaptureOverlay> {
       decoration: const BoxDecoration(color: _panel, borderRadius: BorderRadius.vertical(top: Radius.circular(22))),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         _row([
+          // Saved views first ("the last shot" leading), so shooting again is one tap away.
+          for (final (i, v) in _orderedViews())
+            _chip(v.name, false, () => _goTo(i), icon: v.name == lastShotName ? Icons.photo_camera_outlined : Icons.bookmark_border),
+          _chip('視点を保存', false, _saveView, icon: Icons.bookmark_add_outlined),
           for (var i = 0; i < capturePresets.length; i++)
             _chip(capturePresets[i].$1, _preset == i, () {
               setState(() => _preset = i);
               _vp.applyPreset(i, _frame);
             }, icon: capturePresets[i].$2),
           _chip('全体を収める', false, () => _vp.frameAll(_frame), icon: Icons.fit_screen),
-        ]),
+        ], key: const Key('capture-presets')),
         _row([
           for (var i = 0; i < captureAspects.length; i++)
             _chip(captureAspects[i].$1, _aspect == i, () => setState(() => _aspect = i)),

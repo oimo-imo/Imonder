@@ -182,4 +182,21 @@ void main() {
     expect(obj.split('\n').where((l) => l.startsWith('f ')).length, 30, reason: 'five cubes baked in');
     core.dispose();
   }, skip: exists ? false : 'rust library not built');
+
+  test('saved views and local axes', () {
+    final core = NativeCore(DynamicLibrary.open(File(path).absolute.path));
+    expect(core.views(), isEmpty);
+    expect(core.viewSave('正面', aspect: 1), 0);
+    expect(core.viewSave('前回の撮影', aspect: 0.8, replace: true), 1);
+    expect(core.viewSave('前回の撮影', aspect: 0.8, replace: true), 1, reason: 'replaced, not added');
+    expect(core.views().map((v) => v.name), ['正面', '前回の撮影']);
+    expect(core.viewApply(1), closeTo(0.8, 1e-6));
+    expect(core.viewApply(5), isNull);
+    expect(core.viewRename(0, 'しょうめん'), isTrue);
+    expect(core.viewDelete(1), isTrue);
+    expect(core.views().map((v) => v.name), ['しょうめん']);
+    core.setLocalAxes(true);
+    expect(core.status() & 8192, 8192);
+    core.dispose();
+  }, skip: exists ? false : 'rust library not built');
 }

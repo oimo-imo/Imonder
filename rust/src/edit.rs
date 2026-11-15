@@ -190,14 +190,16 @@ pub struct Snapshot {
     pub sel: Selection,
 }
 
-/// Which of the three move handles (X/Y/Z) lies under `p`, if any.
-pub fn pick_handle(view: &View, centre: V3, len: f32, p: (f32, f32), radius: f32) -> Option<usize> {
+/// Three unit axes a transform works along: the world's or an object's own (local) axes.
+pub type Axes = [V3; 3];
+pub const WORLD: Axes = [v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), v3(0.0, 0.0, 1.0)];
+
+/// Which of the three move handles lies under `p`, if any.
+pub fn pick_handle(view: &View, centre: V3, len: f32, axes: &Axes, p: (f32, f32), radius: f32) -> Option<usize> {
     let c = view.project(centre)?;
     (0..3)
         .filter_map(|axis| {
-            let mut dir = [0.0; 3];
-            dir[axis] = len;
-            let tip = view.project(centre.add(v3(dir[0], dir[1], dir[2])))?;
+            let tip = view.project(centre.add(axes[axis].scale(len)))?;
             let d = dist_to_segment(p, (c.0, c.1), (tip.0, tip.1));
             (d <= radius).then_some((axis, d))
         })
@@ -214,30 +216,30 @@ pub fn axis_vec(axis: usize) -> V3 {
     }
 }
 
-/// Two unit vectors spanning the plane perpendicular to `axis`.
-pub fn ring_basis(axis: usize) -> (V3, V3) {
-    let k = axis_vec(axis);
-    let u = if axis == 2 { v3(1.0, 0.0, 0.0) } else { v3(0.0, 0.0, 1.0) };
+/// Two unit vectors spanning the plane perpendicular to `k`.
+pub fn ring_basis(k: V3) -> (V3, V3) {
+    let u = if k.z.abs() > 0.9 { v3(1.0, 0.0, 0.0) } else { v3(0.0, 0.0, 1.0) };
     let u = u.sub(k.scale(u.dot(k))).norm();
     (u, k.cross(u))
 }
 
 pub const RING_SEGMENTS: usize = 48;
 
-pub fn ring_point(centre: V3, axis: usize, radius: f32, i: usize) -> V3 {
-    let (u, w) = ring_basis(axis);
+/// Point `i` of the rotation ring around the direction `k`.
+pub fn ring_point(centre: V3, k: V3, radius: f32, i: usize) -> V3 {
+    let (u, w) = ring_basis(k);
     let a = i as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
     centre.add(u.scale(a.cos() * radius)).add(w.scale(a.sin() * radius))
 }
 
 /// Which rotation ring lies under `p`.
-pub fn pick_ring(view: &View, centre: V3, radius: f32, p: (f32, f32), tol: f32) -> Option<usize> {
+pub fn pick_ring(view: &View, centre: V3, axes: &Axes, radius: f32, p: (f32, f32), tol: f32) -> Option<usize> {
     (0..3)
         .filter_map(|axis| {
             let mut best = f32::MAX;
-            let mut prev = view.project(ring_point(centre, axis, radius, 0))?;
+            let mut prev = view.project(ring_point(centre, axes[axis], radius, 0))?;
             for i in 1..=RING_SEGMENTS {
-                let cur = view.project(ring_point(centre, axis, radius, i))?;
+                let cur = view.project(ring_point(centre, axes[axis], radius, i))?;
                 best = best.min(dist_to_segment(p, (prev.0, prev.1), (cur.0, cur.1)));
                 prev = cur;
             }

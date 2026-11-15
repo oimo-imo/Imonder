@@ -4,15 +4,17 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::math::{v3, V3};
+use crate::math::V3;
 use crate::mesh::Mesh;
 use crate::ops::clean_faces;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Modifier {
-    /// Reflects across the planes through the object's origin, for each axis switched on.
+    /// Reflects across the planes through the object's origin (perpendicular to its own axes),
+    /// for each axis switched on.
     Mirror { enabled: bool, axes: [bool; 3], merge: bool },
-    /// `count` copies, each shifted along `axis` by `spacing` times the input's size on that axis.
+    /// `count` copies, each shifted along the object's `axis` by `spacing` times the input's size
+    /// in that direction.
     Array { enabled: bool, count: u32, spacing: f32, axis: u8, merge: bool },
 }
 
@@ -72,70 +74,62 @@ impl Modifier {
 }
 
 /// The result of the whole stack. Borrows the base mesh when nothing changes it.
-pub fn evaluate<'a>(base: &'a Mesh, origin: V3, mods: &[Modifier]) -> Cow<'a, Mesh> {
+/// `frame` is the object's own axes (mirror planes and array directions follow them).
+pub fn evaluate<'a>(base: &'a Mesh, origin: V3, frame: &crate::edit::Axes, mods: &[Modifier]) -> Cow<'a, Mesh> {
     let mut out = Cow::Borrowed(base);
     for m in mods.iter().filter(|m| m.enabled()) {
         out = Cow::Owned(match m {
             Modifier::Mirror { axes, merge, .. } => {
                 let mut cur = out.into_owned();
                 for (axis, _) in axes.iter().enumerate().filter(|(_, on)| **on) {
-                    cur = mirror(&cur, origin, axis, *merge);
+                    cur = mirror(&cur, origin, frame[axis], *merge);
                 }
                 cur
             }
-            Modifier::Array { count, spacing, axis, merge, .. } => array(&out, *count, *spacing, *axis as usize, *merge),
+            Modifier::Array { count, spacing, axis, merge, .. } => array(&out, *count, *spacing, frame[*axis as usize], *merge),
         });
     }
     out
 }
 
-fn get(p: V3, axis: usize) -> f32 {
-    [p.x, p.y, p.z][axis]
-}
-
-fn with(p: V3, axis: usize, value: f32) -> V3 {
-    match axis {
-        0 => v3(value, p.y, p.z),
-        1 => v3(p.x, value, p.z),
-        _ => v3(p.x, p.y, value),
-    }
-}
 
 /// Size-aware tolerance for "on the plane" / "the same point".
 fn tolerance(m: &Mesh) -> f32 {
     m.bounds().map_or(1e-4, |(lo, hi)| (hi.sub(lo).len() * 1e-4).max(1e-5))
 }
 
-fn mirror(m: &Mesh, origin: V3, axis: usize, merge: bool) -> Mesh {
+/// Reflects across the plane through `origin` with unit normal `n`.
+fn mirror(m: &Mesh, origin: V3, n: V3, merge: bool) -> Mesh {
     let eps = tolerance(m);
-    let o = get(origin, axis);
-    let n = m.verts.len() as u32;
     let mut verts = m.verts.clone();
     let mut map = Vec::with_capacity(m.verts.len());
     for (i, &p) in m.verts.iter().enumerate() {
-        if merge && (get(p, axis) - o).abs() <= eps {
+        let d = p.sub(origin).dot(n);
+        if merge && d.abs() <= eps {
             map.push(i as u32); // on the plane: shared by both halves
         } else {
             map.push(verts.len() as u32);
-            verts.push(with(p, axis, 2.0 * o - get(p, axis)));
+            verts.push(p.sub(n.scale(2.0 * d)));
         }
     }
     let mut faces = m.faces.clone();
     // Reflection flips handedness, so reverse each mirrored face to keep it facing outwards.
     faces.extend(m.faces.iter().map(|f| f.iter().rev().map(|&i| map[i as usize]).collect::<Vec<u32>>()));
-    let _ = n;
     finish(verts, faces, merge)
 }
 
-fn array(m: &Mesh, count: u32, spacing: f32, axis: usize, merge: bool) -> Mesh {
+/// Copies along the unit direction `dir`, spaced by the input's extent in that direction.
+fn array(m: &Mesh, count: u32, spacing: f32, dir: V3, merge: bool) -> Mesh {
     let count = count.clamp(1, MAX_ARRAY);
-    let size = m.bounds().map_or(1.0, |(lo, hi)| get(hi.sub(lo), axis)).max(1e-6);
+    let lo = m.verts.iter().map(|p| p.dot(dir)).fold(f32::MAX, f32::min);
+    let hi = m.verts.iter().map(|p| p.dot(dir)).fold(f32::MIN, f32::max);
+    let size = if m.verts.is_empty() { 1.0 } else { (hi - lo).max(1e-6) };
     let step = size * spacing;
     let n = m.verts.len() as u32;
     let mut verts = Vec::with_capacity(m.verts.len() * count as usize);
     let mut faces = Vec::with_capacity(m.faces.len() * count as usize);
     for k in 0..count {
-        let shift = with(v3(0.0, 0.0, 0.0), axis, step * k as f32);
+        let shift = dir.scale(step * k as f32);
         verts.extend(m.verts.iter().map(|p| p.add(shift)));
         faces.extend(m.faces.iter().map(|f| f.iter().map(|&i| i + k * n).collect::<Vec<u32>>()));
     }
@@ -200,13 +194,15 @@ fn finish(verts: Vec<V3>, faces: Vec<Vec<u32>>, remove_internal: bool) -> Mesh {
 }
 
 /// Bakes the stack into a plain mesh (for "apply").
-pub fn apply_all(base: &Mesh, origin: V3, mods: &[Modifier]) -> Mesh {
-    evaluate(base, origin, mods).into_owned()
+pub fn apply_all(base: &Mesh, origin: V3, frame: &crate::edit::Axes, mods: &[Modifier]) -> Mesh {
+    evaluate(base, origin, frame, mods).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::WORLD;
+    use crate::math::v3;
 
     fn closed(m: &Mesh) -> bool {
         let mut dir: BTreeMap<(u32, u32), i32> = BTreeMap::new();
@@ -247,18 +243,18 @@ mod tests {
     fn mirror_closes_a_half_model_across_the_origin() {
         let half = half_cube();
         assert!(!closed(&half));
-        let m = evaluate(&half, v3(0.0, 0.0, 0.0), &[mirror_x(true)]);
+        let m = evaluate(&half, v3(0.0, 0.0, 0.0), &WORLD, &[mirror_x(true)]);
         assert!(closed(&m), "the seam is welded");
         assert_eq!((m.verts.len(), m.faces.len()), (12, 10));
         assert!((volume(&m) - 8.0).abs() < 1e-4, "outward and complete: {}", volume(&m));
-        let unmerged = evaluate(&half, v3(0.0, 0.0, 0.0), &[mirror_x(false)]);
+        let unmerged = evaluate(&half, v3(0.0, 0.0, 0.0), &WORLD, &[mirror_x(false)]);
         assert_eq!(unmerged.verts.len(), 16, "without merging the seam stays open");
     }
 
     #[test]
     fn mirror_uses_the_origin_and_drops_faces_on_the_plane() {
         // A whole cube mirrored around x = 1 (its right face sits on the plane).
-        let m = apply_all(&Mesh::cube(1.0), v3(1.0, 0.0, 0.0), &[mirror_x(true)]);
+        let m = apply_all(&Mesh::cube(1.0), v3(1.0, 0.0, 0.0), &WORLD, &[mirror_x(true)]);
         assert!(closed(&m));
         let (lo, hi) = m.bounds().unwrap();
         assert_eq!((lo.x, hi.x), (-1.0, 3.0));
@@ -272,7 +268,7 @@ mod tests {
             v.y = v.y.max(0.0);
         }
         m.faces.retain(|f| f.iter().any(|&i| m.verts[i as usize].y > 0.5));
-        let r = evaluate(&m, v3(0.0, 0.0, 0.0), &[Modifier::Mirror { enabled: true, axes: [true, true, false], merge: true }]);
+        let r = evaluate(&m, v3(0.0, 0.0, 0.0), &WORLD, &[Modifier::Mirror { enabled: true, axes: [true, true, false], merge: true }]);
         assert!(closed(&r));
         assert!((volume(&r) - 8.0).abs() < 1e-4);
     }
@@ -280,15 +276,15 @@ mod tests {
     #[test]
     fn array_copies_side_by_side_and_merges_into_one_bar() {
         let arr = |merge| Modifier::Array { enabled: true, count: 3, spacing: 1.0, axis: 0, merge };
-        let m = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &[arr(false)]);
+        let m = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &WORLD, &[arr(false)]);
         assert_eq!((m.verts.len(), m.faces.len()), (24, 18));
         let (lo, hi) = m.bounds().unwrap();
         assert_eq!((lo.x, hi.x), (-1.0, 5.0), "touching copies with spacing 1");
-        let bar = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &[arr(true)]);
+        let bar = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &WORLD, &[arr(true)]);
         assert!(closed(&bar));
         assert_eq!((bar.verts.len(), bar.faces.len()), (16, 14));
         assert!((volume(&bar) - 24.0).abs() < 1e-3);
-        let gap = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &[Modifier::Array { enabled: true, count: 2, spacing: -1.5, axis: 2, merge: false }]);
+        let gap = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &WORLD, &[Modifier::Array { enabled: true, count: 2, spacing: -1.5, axis: 2, merge: false }]);
         let (lo, _) = gap.bounds().unwrap();
         assert_eq!(lo.z, -4.0, "negative spacing goes the other way");
     }
@@ -297,12 +293,28 @@ mod tests {
     fn stack_order_disabled_and_borrowed() {
         let base = Mesh::cube(1.0);
         let off = Modifier::Array { enabled: false, count: 5, spacing: 1.0, axis: 0, merge: false };
-        assert!(matches!(evaluate(&base, v3(0.0, 0.0, 0.0), &[off]), Cow::Borrowed(_)), "nothing to do, no copy");
+        assert!(matches!(evaluate(&base, v3(0.0, 0.0, 0.0), &WORLD, &[off]), Cow::Borrowed(_)), "nothing to do, no copy");
         // Array then mirror: 2 copies to +X, then mirrored around x = 0 → 4 cubes across -5..5.
         let mods = [Modifier::Array { enabled: true, count: 2, spacing: 1.5, axis: 0, merge: false }, mirror_x(true)];
-        let r = evaluate(&base, v3(0.0, 0.0, 0.0), &mods);
+        let r = evaluate(&base, v3(0.0, 0.0, 0.0), &WORLD, &mods);
         let (lo, hi) = r.bounds().unwrap();
         assert_eq!((lo.x, hi.x), (-4.0, 4.0));
+    }
+
+    #[test]
+    fn mirror_and_array_follow_a_turned_object() {
+        // An object turned 90° about Z: its own X points along world Y.
+        let axes = [v3(0.0, 1.0, 0.0), v3(-1.0, 0.0, 0.0), v3(0.0, 0.0, 1.0)];
+        let mut m = Mesh::cube(1.0);
+        for v in &mut m.verts {
+            v.y += 3.0; // sits at y 2..4
+        }
+        let r = apply_all(&m, v3(0.0, 0.0, 0.0), &axes, &[mirror_x(true)]);
+        let (lo, hi) = r.bounds().unwrap();
+        assert_eq!((lo.y, hi.y, lo.x, hi.x), (-4.0, 4.0, -1.0, 1.0), "mirrored across the object's X, i.e. world Y");
+        let a = apply_all(&Mesh::cube(1.0), v3(0.0, 0.0, 0.0), &axes, &[Modifier::Array { enabled: true, count: 3, spacing: 1.0, axis: 0, merge: false }]);
+        let (lo, hi) = a.bounds().unwrap();
+        assert_eq!((lo.y, hi.y), (-1.0, 5.0), "copies run along world Y");
     }
 
     #[test]

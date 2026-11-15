@@ -20,18 +20,44 @@ pub struct Object {
     pub origin: V3,
     /// Applied on top of `mesh`, in order, whenever the result is shown or exported.
     pub modifiers: Vec<Modifier>,
+    /// The object's own axes (turned by object-mode rotation): used for local-axis transforms
+    /// and by the modifiers.
+    pub basis: crate::edit::Axes,
+}
+
+/// A camera position saved in the work (to come back to, or to shoot again from).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedView {
+    pub name: String,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub target: V3,
+    pub ortho: bool,
+    /// Width / height of the capture frame when it was saved (0 if saved while editing).
+    pub aspect: f32,
+}
+
+impl SavedView {
+    pub fn of(name: &str, cam: &Camera, aspect: f32) -> SavedView {
+        SavedView { name: name.into(), yaw: cam.yaw, pitch: cam.pitch, distance: cam.distance, target: cam.target, ortho: cam.ortho, aspect }
+    }
+
+    pub fn apply(&self, cam: &mut Camera) {
+        (cam.yaw, cam.pitch, cam.distance, cam.target, cam.ortho) = (self.yaw, self.pitch, self.distance, self.target, self.ortho);
+    }
 }
 
 impl Object {
     /// A new object whose origin is the centre of its mesh.
     pub fn new(name: String, mesh: Mesh) -> Object {
         let origin = mesh.bounds().map_or(v3(0.0, 0.0, 0.0), |(lo, hi)| lo.add(hi).scale(0.5));
-        Object { name, mesh, visible: true, selected: false, group: 0, origin, modifiers: Vec::new() }
+        Object { name, mesh, visible: true, selected: false, group: 0, origin, modifiers: Vec::new(), basis: crate::edit::WORLD }
     }
 
     /// The mesh with the modifier stack applied (borrowed when there is nothing to apply).
     pub fn evaluated(&self) -> Cow<'_, Mesh> {
-        crate::modifier::evaluate(&self.mesh, self.origin, &self.modifiers)
+        crate::modifier::evaluate(&self.mesh, self.origin, &self.basis, &self.modifiers)
     }
 }
 
@@ -39,6 +65,8 @@ impl Object {
 pub struct Scene {
     pub objects: Vec<Object>,
     pub active: usize,
+    /// Saved camera positions. Not part of undo: undoing an edit never forgets a saved view.
+    pub views: Vec<SavedView>,
 }
 
 static EMPTY: Mesh = Mesh { verts: Vec::new(), faces: Vec::new() };
@@ -48,7 +76,7 @@ impl Scene {
     pub fn starter() -> Scene {
         let mut cube = Object::new("立方体".into(), Mesh::cube(1.0));
         cube.selected = true;
-        Scene { objects: vec![cube], active: 0 }
+        Scene { objects: vec![cube], active: 0, views: Vec::new() }
     }
 
     pub fn has_active(&self) -> bool {
@@ -196,6 +224,7 @@ impl Scene {
             self.objects[k].selected = true;
             self.objects[k].origin = src.origin;
             self.objects[k].modifiers = src.modifiers.clone();
+            self.objects[k].basis = src.basis;
             if src.group != 0 {
                 self.objects[k].group = *remap.entry(src.group).or_insert_with(|| {
                     next_group += 1;
@@ -255,9 +284,9 @@ impl Scene {
     // ------------------------------------------------------------------ file format --
 
     const MAGIC: &'static [u8; 4] = b"IMND";
-    /// 2 added the selected flag and group id per object, 3 the origin and modifier stack.
-    /// Older files still open.
-    const VERSION: u32 = 3;
+    /// 2 added the selected flag and group id per object, 3 the origin and modifier stack,
+    /// 4 each object's axes and the saved views. Older files still open.
+    const VERSION: u32 = 4;
 
     /// Serialises the scene and the camera into the `.imnd` binary format.
     pub fn to_bytes(&self, cam: &Camera) -> Vec<u8> {
@@ -297,6 +326,11 @@ impl Scene {
                     }
                 }
             }
+            for a in &o.basis {
+                for f in [a.x, a.y, a.z] {
+                    put_f32(&mut w, f);
+                }
+            }
             put_u32(&mut w, o.mesh.verts.len() as u32);
             for v in &o.mesh.verts {
                 put_f32(&mut w, v.x);
@@ -310,6 +344,15 @@ impl Scene {
                     put_u32(&mut w, i);
                 }
             }
+        }
+        put_u32(&mut w, self.views.len() as u32);
+        for v in &self.views {
+            put_u32(&mut w, v.name.len() as u32);
+            w.extend_from_slice(v.name.as_bytes());
+            for f in [v.yaw, v.pitch, v.distance, v.target.x, v.target.y, v.target.z, v.aspect] {
+                put_f32(&mut w, f);
+            }
+            w.push(v.ortho as u8);
         }
         w
     }
@@ -367,6 +410,12 @@ impl Scene {
                     });
                 }
             }
+            let mut basis = crate::edit::WORLD;
+            if version >= 4 {
+                for a in &mut basis {
+                    *a = v3(r.f32()?, r.f32()?, r.f32()?);
+                }
+            }
             let nv = r.u32()? as usize;
             let mut verts = Vec::new();
             for _ in 0..nv {
@@ -390,16 +439,33 @@ impl Scene {
                 faces.push(f);
             }
             let mut o = Object::new(name, Mesh { verts, faces });
+            o.basis = basis;
             (o.visible, o.selected, o.group, o.modifiers) = (visible, selected, group, modifiers);
             if let Some(origin) = origin {
                 o.origin = origin;
             }
             objects.push(o);
         }
+        let mut views = Vec::new();
+        if version >= 4 {
+            let n = r.u32()? as usize;
+            if n > 1000 {
+                return None;
+            }
+            for _ in 0..n {
+                let len = r.u32()? as usize;
+                let name = String::from_utf8(r.take(len)?.to_vec()).ok()?;
+                let (yaw, pitch, distance) = (r.f32()?, r.f32()?, r.f32()?);
+                let target = v3(r.f32()?, r.f32()?, r.f32()?);
+                let aspect = r.f32()?;
+                let ortho = r.take(1)?[0] != 0;
+                views.push(SavedView { name, yaw, pitch, distance, target, ortho, aspect });
+            }
+        }
         if r.p != data.len() || (active >= objects.len() && !objects.is_empty()) {
             return None;
         }
-        Some((Scene { objects, active }, cam))
+        Some((Scene { objects, active, views }, cam))
     }
 }
 
@@ -432,7 +498,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
@@ -460,6 +526,9 @@ mod tests {
             Modifier::Mirror { enabled: true, axes: [true, false, true], merge: false },
             Modifier::Array { enabled: false, count: 4, spacing: -0.5, axis: 1, merge: true },
         ];
+        s.objects[1].basis = [v3(0.0, 1.0, 0.0), v3(-1.0, 0.0, 0.0), v3(0.0, 0.0, 1.0)];
+        let cam = Camera { yaw: 0.25, pitch: 0.6, distance: 9.5, target: v3(1.0, 0.0, 2.0), ortho: true, ..Camera::default() };
+        s.views.push(SavedView::of("前回の撮影", &cam, 1.0));
         s.active = 0;
         s
     }
@@ -471,6 +540,7 @@ mod tests {
         let bytes = s.to_bytes(&cam);
         let (s2, cam2) = Scene::from_bytes(&bytes).unwrap();
         assert_eq!(s2.objects, s.objects);
+        assert_eq!(s2.views, s.views);
         assert_eq!(s2.active, 0);
         assert_eq!((cam2.yaw, cam2.pitch, cam2.distance, cam2.target), (1.25, -0.3, 9.0, v3(1.0, 2.0, 3.0)));
     }
@@ -500,7 +570,7 @@ mod tests {
 
     #[test]
     fn empty_scene_roundtrips() {
-        let s = Scene { objects: vec![], active: 0 };
+        let s = Scene { objects: vec![], active: 0, views: Vec::new() };
         let (s2, _) = Scene::from_bytes(&s.to_bytes(&Camera::default())).unwrap();
         assert!(s2.objects.is_empty() && s2.mesh().verts.is_empty() && !s2.has_active());
     }

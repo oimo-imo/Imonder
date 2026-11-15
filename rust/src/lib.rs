@@ -111,6 +111,8 @@ pub struct Core {
     capture: Option<CaptureOpts>,
     /// Snap transforms to other objects' surfaces / the grid / angle and scale steps.
     pub snap: bool,
+    /// Transform along the active object's own axes instead of the world's.
+    pub local_axes: bool,
     /// The modifier parameter last changed, so a slider drag becomes one undo step.
     modifier_undo_key: Option<(usize, usize, i32)>,
     /// The editing camera, put back when capture mode ends.
@@ -133,6 +135,7 @@ impl Core {
             rev: 0,
             capture: None,
             snap: false,
+            local_axes: false,
             modifier_undo_key: None,
             camera_before_capture: None,
         }
@@ -157,7 +160,10 @@ impl Core {
 
     fn restore(&mut self, s: Snapshot) {
         self.modifier_undo_key = None;
+        // Saved views are not part of undo: keep the current ones.
+        let views = std::mem::take(&mut self.scene.views);
         self.scene = s.scene;
+        self.scene.views = views;
         self.sel = s.sel;
         self.drag = None;
         self.last_op = None;
@@ -210,14 +216,22 @@ impl Core {
         }
     }
 
-    fn handle_geometry(&self) -> Option<(V3, f32, render::HandleStyle)> {
+    /// The axes transforms follow in `scene`: the world's, or the active object's own.
+    fn axes_in(&self, scene: &Scene) -> edit::Axes {
+        match (self.local_axes, scene.objects.get(scene.active)) {
+            (true, Some(o)) => o.basis,
+            _ => edit::WORLD,
+        }
+    }
+
+    fn handle_geometry(&self) -> Option<(V3, f32, render::HandleStyle, edit::Axes)> {
         let style = self.handle_style()?;
         let targets = self.transform_targets();
         if targets.is_empty() {
             return None;
         }
         let centre = self.pivot_in(&self.scene, &targets)?;
-        Some((centre, self.camera.distance * 0.18, style))
+        Some((centre, self.camera.distance * 0.18, style, self.axes_in(&self.scene)))
     }
 
     pub fn render(&self, w: usize, h: usize, scale: f32, out: &mut [u8]) {
@@ -479,7 +493,7 @@ impl Core {
     /// Bit 0: can undo, bit 1: can redo, bit 2: something is selected,
     /// bit 3: an adjustable operation is active, bits 4-5: select mode (0 vertex, 1 edge, 2 face),
     /// bit 6: edit mode, bit 7: an object is active, bit 8: orthographic view, bit 9: capture mode, bit 10: snapping, bit 11: two or more objects selected,
-    /// bit 12: a selected object is in a group.
+    /// bit 12: a selected object is in a group, bit 13: local axes.
     pub fn status(&self) -> i32 {
         (!self.undo.is_empty()) as i32
             | ((!self.redo.is_empty()) as i32) << 1
@@ -497,6 +511,7 @@ impl Core {
             | (self.snap as i32) << 10
             | ((self.scene.selected_indices().len() >= 2) as i32) << 11
             | (self.scene.objects.iter().any(|o| o.selected && o.group != 0) as i32) << 12
+            | (self.local_axes as i32) << 13
     }
 
     // -------------------------------------------------------------------- objects --
@@ -668,11 +683,13 @@ impl Core {
         if self.capture.is_some() {
             return false;
         }
-        let Some((centre, len, style)) = self.handle_geometry() else { return false };
+        let Some((centre, len, style, axes)) = self.handle_geometry() else { return false };
         let view = self.view();
         let p = (nx * view.aspect, ny);
         let drag = match style {
-            render::HandleStyle::Move => edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(|axis| Drag::Move { axis, free: 0.0 }),
+            render::HandleStyle::Move => {
+                edit::pick_handle(&view, centre, len, &axes, p, HANDLE_RADIUS).map(|axis| Drag::Move { axis, free: 0.0 })
+            }
             render::HandleStyle::Scale => {
                 let near_centre = view
                     .project(centre)
@@ -680,11 +697,11 @@ impl Core {
                 if near_centre {
                     Some(Drag::Scale { axis: 3, free: 1.0 })
                 } else {
-                    edit::pick_handle(&view, centre, len, p, HANDLE_RADIUS).map(|axis| Drag::Scale { axis, free: 1.0 })
+                    edit::pick_handle(&view, centre, len, &axes, p, HANDLE_RADIUS).map(|axis| Drag::Scale { axis, free: 1.0 })
                 }
             }
             render::HandleStyle::Rotate => {
-                edit::pick_ring(&view, centre, len * 0.9, p, HANDLE_RADIUS * 0.7).map(|axis| Drag::Rotate { axis, last: p, free: 0.0 })
+                edit::pick_ring(&view, centre, &axes, len * 0.9, p, HANDLE_RADIUS * 0.7).map(|axis| Drag::Rotate { axis, last: p, free: 0.0 })
             }
         };
         let Some(drag) = drag else { return false };
@@ -702,19 +719,19 @@ impl Core {
 
     /// Applies a drag step. Deltas are fractions of width / height.
     pub fn drag_update(&mut self, dnx: f32, dny: f32) {
-        let (Some(drag), Some((centre, len, _))) = (self.drag, self.handle_geometry()) else { return };
+        let (Some(drag), Some((centre, len, _, axes))) = (self.drag, self.handle_geometry()) else { return };
         let view = self.view();
         let d = (dnx * view.aspect, dny);
         let next = match drag {
             Drag::Move { axis, free } => {
-                let Some(t) = axis_drag(&view, centre, axis, d) else { return };
+                let Some(t) = axis_drag(&view, centre, axes[axis], d) else { return };
                 Drag::Move { axis, free: free + t }
             }
             Drag::Scale { axis, free } => {
                 let f = if axis == 3 {
                     1.0 + (d.0 - d.1) * 2.0
                 } else {
-                    let Some(t) = axis_drag(&view, centre, axis, d) else { return };
+                    let Some(t) = axis_drag(&view, centre, axes[axis], d) else { return };
                     1.0 + t / len
                 }
                 .max(0.05);
@@ -732,7 +749,7 @@ impl Core {
                 while da < -std::f32::consts::PI {
                     da += std::f32::consts::TAU;
                 }
-                if view.eye.sub(centre).dot(edit::axis_vec(axis)) < 0.0 {
+                if view.eye.sub(centre).dot(axes[axis]) < 0.0 {
                     da = -da; // seen from the negative side the rotation looks reversed
                 }
                 Drag::Rotate { axis, last: now, free: free + da }
@@ -753,15 +770,17 @@ impl Core {
             return;
         }
         let Some(pivot) = self.pivot_in(&base, &targets) else { return };
+        // The axes as they were when the drag began (rotating the object turns its own axes).
+        let axes = self.axes_in(&base);
         let apply: Box<dyn Fn(V3) -> V3> = match drag {
             Drag::Move { axis, free } => {
-                let t = if self.snap { self.snapped_move(&base, &targets, axis, free) } else { free };
-                let dir = edit::axis_vec(axis);
+                let dir = axes[axis];
+                let t = if self.snap { self.snapped_move(&base, &targets, dir, free) } else { free };
                 Box::new(move |v| v.add(dir.scale(t)))
             }
             Drag::Scale { axis, free } => {
                 let f = if self.snap { snap::snap_scale(free) } else { free };
-                let k = edit::axis_vec(axis.min(2));
+                let k = axes[axis.min(2)];
                 if axis == 3 {
                     Box::new(move |v| pivot.add(v.sub(pivot).scale(f)))
                 } else {
@@ -773,7 +792,7 @@ impl Core {
             }
             Drag::Rotate { axis, free, .. } => {
                 let a = if self.snap { snap::snap_angle(free) } else { free };
-                let k = edit::axis_vec(axis);
+                let k = axes[axis];
                 Box::new(move |v| edit::rotate_about(v, pivot, k, a))
             }
         };
@@ -785,6 +804,13 @@ impl Core {
             }
             if !self.edit_mode {
                 to.origin = apply(from.origin); // the pivot travels with the object
+                // So do its own axes (turned by rotations; kept unit length under scaling).
+                for k in 0..3 {
+                    let d = apply(from.origin.add(from.basis[k])).sub(to.origin);
+                    if d.len() > 1e-9 {
+                        to.basis[k] = d.norm();
+                    }
+                }
             }
         }
         self.rev += 1;
@@ -792,7 +818,7 @@ impl Core {
 
     /// The translation to apply for a move dragged `free` along `axis`, snapped to the
     /// surfaces of the visible objects that are not moving, or to the grid.
-    fn snapped_move(&self, base: &Scene, targets: &[(usize, std::collections::BTreeSet<u32>)], axis: usize, free: f32) -> f32 {
+    fn snapped_move(&self, base: &Scene, targets: &[(usize, std::collections::BTreeSet<u32>)], dir: V3, free: f32) -> f32 {
         let mut moved: Vec<V3> = Vec::new();
         let mut moved_faces: Vec<Vec<V3>> = Vec::new();
         for (oi, verts) in targets {
@@ -822,11 +848,72 @@ impl Core {
             .collect();
         let others: Vec<&Mesh> = others.iter().map(|m| &**m).collect();
         let d = self.camera.distance;
-        snap::snap_move(&moved, &moved_faces, &others, axis, free, d * 0.04, snap::grid_step(d))
+        snap::snap_move(&moved, &moved_faces, &others, dir, free, d * 0.04, snap::grid_step(d))
     }
 
     pub fn set_snap(&mut self, on: bool) {
         self.snap = on;
+    }
+
+    pub fn set_local_axes(&mut self, on: bool) {
+        self.local_axes = on;
+        self.drag = None;
+    }
+
+    // -------------------------------------------------------------------- views --
+
+    pub fn views_json(&self) -> String {
+        let items: Vec<String> = self
+            .scene
+            .views
+            .iter()
+            .map(|v| format!("{{\"name\":{},\"ortho\":{},\"aspect\":{}}}", scene::json_string(&v.name), v.ortho, v.aspect))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// Saves the current camera under `name`. With `replace`, a view of the same name is
+    /// overwritten (used for "the last shot"). Returns its index.
+    pub fn view_save(&mut self, name: &str, aspect: f32, replace: bool) -> usize {
+        let v = scene::SavedView::of(name, &self.camera, aspect);
+        self.rev += 1;
+        if replace {
+            if let Some(i) = self.scene.views.iter().position(|x| x.name == name) {
+                self.scene.views[i] = v;
+                return i;
+            }
+        }
+        self.scene.views.push(v);
+        self.scene.views.len() - 1
+    }
+
+    /// Moves the camera to a saved view. Returns the frame aspect it was saved with
+    /// (0 = saved while editing), or None for a bad index.
+    pub fn view_apply(&mut self, index: usize) -> Option<f32> {
+        let v = self.scene.views.get(index)?.clone();
+        v.apply(&mut self.camera);
+        Some(v.aspect)
+    }
+
+    pub fn view_delete(&mut self, index: usize) -> bool {
+        if index >= self.scene.views.len() {
+            return false;
+        }
+        self.scene.views.remove(index);
+        self.rev += 1;
+        true
+    }
+
+    pub fn view_rename(&mut self, index: usize, name: &str) -> bool {
+        let name = name.trim();
+        match self.scene.views.get_mut(index) {
+            Some(v) if !name.is_empty() => {
+                v.name = name.into();
+                self.rev += 1;
+                true
+            }
+            _ => false,
+        }
     }
 
     // ---------------------------------------------------------------- modifiers --
@@ -890,7 +977,7 @@ impl Core {
         if index >= o.modifiers.len() {
             return false;
         }
-        let baked = modifier::apply_all(&o.mesh, o.origin, &o.modifiers[..=index]);
+        let baked = modifier::apply_all(&o.mesh, o.origin, &o.basis, &o.modifiers[..=index]);
         self.push_undo();
         let o = &mut self.scene.objects[active];
         o.mesh = baked;
@@ -931,7 +1018,7 @@ impl Core {
             .filter(|o| o.visible)
             .map(|o| scene::Object { selected: false, group: 0, ..o.clone() })
             .collect();
-        Scene { objects, active: 0 }.to_bytes(&self.camera)
+        Scene { objects, active: 0, views: Vec::new() }.to_bytes(&self.camera)
     }
 
     /// Adds every object of a saved work (a preset) to this one, where they were saved.
@@ -960,9 +1047,8 @@ impl Core {
     }
 }
 
-/// How far (in world units) a screen drag `d` moves along `axis` at `centre`.
-fn axis_drag(view: &View, centre: V3, axis: usize, d: (f32, f32)) -> Option<f32> {
-    let dir = edit::axis_vec(axis);
+/// How far (in world units) a screen drag `d` moves along the unit direction `dir` at `centre`.
+fn axis_drag(view: &View, centre: V3, dir: V3, d: (f32, f32)) -> Option<f32> {
     let (a, b) = (view.project(centre)?, view.project(centre.add(dir))?);
     let s = (b.0 - a.0, b.1 - a.1);
     let s2 = s.0 * s.0 + s.1 * s.1;
@@ -1533,6 +1619,70 @@ pub unsafe extern "C" fn imonder_modifier_finish(core: *mut Core, index: i32, ap
     (if apply != 0 { c.modifier_apply(index as usize) } else { c.modifier_remove(index as usize) }) as i32
 }
 
+/// Transforms follow the active object's own axes (1) or the world's (0).
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_set_local_axes(core: *mut Core, on: i32) {
+    if let Some(c) = core.as_mut() {
+        c.set_local_axes(on != 0);
+    }
+}
+
+/// Saved views as UTF-8 JSON `[{"name":..,"ortho":..,"aspect":..}]`. Free with `imonder_free_bytes`.
+///
+/// # Safety
+/// `core` must be live and `out_len` a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_views_json(core: *const Core, out_len: *mut u32) -> *mut u8 {
+    let json = core.as_ref().map_or_else(|| "[]".to_string(), |c| c.views_json());
+    leak_bytes(json.into_bytes(), out_len)
+}
+
+unsafe fn utf8_arg<'a>(ptr: *const u8, len: u32) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(ptr, len as usize)).ok()
+}
+
+/// Saves the current camera as a view named by the UTF-8 bytes `name`. With `replace`, a view
+/// of the same name is overwritten. Returns its index, or -1.
+///
+/// # Safety
+/// `core` must be live and `name` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_view_save(core: *mut Core, name: *const u8, len: u32, aspect: f32, replace: i32) -> i32 {
+    let (Some(c), Some(n)) = (core.as_mut(), utf8_arg(name, len)) else { return -1 };
+    c.view_save(n, aspect, replace != 0) as i32
+}
+
+/// Moves the camera to a saved view. Returns the frame aspect it was saved with (0 = while
+/// editing), or -1 for a bad index.
+///
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_view_apply(core: *mut Core, index: i32) -> f32 {
+    core.as_mut().and_then(|c| if index < 0 { None } else { c.view_apply(index as usize) }).unwrap_or(-1.0)
+}
+
+/// # Safety
+/// `core` must be a live pointer from `imonder_create`.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_view_delete(core: *mut Core, index: i32) -> i32 {
+    core.as_mut().map_or(0, |c| (index >= 0 && c.view_delete(index as usize)) as i32)
+}
+
+/// # Safety
+/// `core` must be live and `name` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn imonder_view_rename(core: *mut Core, index: i32, name: *const u8, len: u32) -> i32 {
+    let (Some(c), Some(n)) = (core.as_mut(), utf8_arg(name, len)) else { return 0 };
+    (index >= 0 && c.view_rename(index as usize, n)) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1652,7 +1802,7 @@ mod tests {
         c.tap(0.5, 0.5, false);
         let before = c.mesh().verts.clone();
         let view = c.view();
-        let (centre, len, _) = c.handle_geometry().unwrap();
+        let (centre, len, _, _) = c.handle_geometry().unwrap();
         let tip = view.project(centre.add(math::v3(len, 0.0, 0.0))).unwrap();
         // Grab the X handle near its tip, drag 0.1 of the width to the right.
         assert!(c.drag_begin(tip.0 / view.aspect, tip.1));
@@ -1674,7 +1824,7 @@ mod tests {
     /// Grabs the handle of `axis` near its tip and drags by (`dx`,`dy`) viewport fractions.
     fn drag_axis_tip(c: &mut Core, axis: usize, dx: f32, dy: f32) {
         let view = c.view();
-        let (centre, len, _) = c.handle_geometry().unwrap();
+        let (centre, len, _, _) = c.handle_geometry().unwrap();
         let tip = view.project(centre.add(edit::axis_vec(axis).scale(len))).unwrap();
         assert!(c.drag_begin(tip.0 / view.aspect, tip.1), "handle {axis} not grabbed");
         c.drag_update(dx, dy);
@@ -1709,9 +1859,9 @@ mod tests {
         c.tap(0.5, 0.5, false);
         let centre = selected_centre(&c);
         let view = c.view();
-        let (_, len, _) = c.handle_geometry().unwrap();
+        let (_, len, _, _) = c.handle_geometry().unwrap();
         // The Y ring (around the viewing axis) seen face-on: grab it at the top and drag sideways (along its tangent).
-        let p = view.project(edit::ring_point(centre, 1, len * 0.9, 0)).unwrap();
+        let p = view.project(edit::ring_point(centre, edit::axis_vec(1), len * 0.9, 0)).unwrap();
         assert!(c.drag_begin(p.0 / view.aspect, p.1));
         c.drag_update(0.08, 0.0);
         c.drag_end();
@@ -1829,7 +1979,7 @@ mod tests {
         c.select_object(0);
         let before: Vec<_> = c.scene.objects.iter().map(|o| o.mesh.verts.clone()).collect();
         let view = c.view();
-        let (centre, len, _) = c.handle_geometry().unwrap();
+        let (centre, len, _, _) = c.handle_geometry().unwrap();
         let tip = view.project(centre.add(edit::axis_vec(0).scale(len))).unwrap();
         assert!(c.drag_begin(tip.0 / view.aspect, tip.1));
         c.drag_update(0.1, 0.0);
@@ -2078,7 +2228,7 @@ mod tests {
             let mut buf = vec![0u8; w * h * 4];
             c.render(w, h, 1.0, &mut buf);
             let view = c.view();
-            let (centre, len, _) = c.handle_geometry().unwrap();
+            let (centre, len, _, _) = c.handle_geometry().unwrap();
             let a = view.project(centre).unwrap();
             let b = view.project(centre.add(edit::axis_vec(0).scale(len))).unwrap();
             let to_px = |p: (f32, f32)| (p.0 / view.aspect * w as f32, p.1 * h as f32);
@@ -2403,6 +2553,88 @@ mod tests {
         assert!(c.duplicate_object());
         assert_eq!(c.scene.objects[1].modifiers.len(), 1);
         assert_eq!(c.scene.objects[1].origin, c.scene.objects[0].origin);
+    }
+
+    #[test]
+    fn rotating_an_object_turns_its_own_axes_and_local_moves_follow_them() {
+        let mut c = object_core();
+        c.select_object(0);
+        let quarter = std::f32::consts::FRAC_PI_2;
+        c.begin_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: 0.0 });
+        c.apply_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: quarter });
+        c.drag_end();
+        let b = c.scene.objects[0].basis;
+        assert!(b[0].sub(math::v3(0.0, 1.0, 0.0)).len() < 1e-5, "local X now points along world Y: {:?}", b[0]);
+        assert!(b[2].sub(math::v3(0.0, 0.0, 1.0)).len() < 1e-5);
+        // Local: moving along X goes along world Y.
+        c.set_local_axes(true);
+        assert_eq!(c.status() & 8192, 8192);
+        assert!(c.handle_geometry().unwrap().3[0].sub(b[0]).len() < 1e-6, "handles follow the object");
+        let before = c.scene.selection_bounds().unwrap();
+        c.begin_transform(Drag::Move { axis: 0, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 0, free: 2.0 });
+        c.drag_end();
+        let after = c.scene.selection_bounds().unwrap();
+        assert!((after.0.y - before.0.y - 2.0).abs() < 1e-4 && (after.0.x - before.0.x).abs() < 1e-4);
+        // World: X is X again.
+        c.set_local_axes(false);
+        c.begin_transform(Drag::Move { axis: 0, free: 0.0 });
+        c.apply_transform(Drag::Move { axis: 0, free: 1.0 });
+        c.drag_end();
+        let world = c.scene.selection_bounds().unwrap();
+        assert!((world.0.x - after.0.x - 1.0).abs() < 1e-4);
+        // The object's axes are saved with the work.
+        let mut d = Core::new();
+        assert!(d.load(&c.to_bytes()));
+        assert!(d.scene.objects[0].basis[0].sub(b[0]).len() < 1e-6);
+    }
+
+    #[test]
+    fn local_scale_stretches_along_the_turned_axis() {
+        let mut c = object_core();
+        c.select_object(0);
+        c.begin_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: 0.0 });
+        c.apply_transform(Drag::Rotate { axis: 2, last: (0.0, 0.0), free: std::f32::consts::FRAC_PI_4 });
+        c.drag_end();
+        c.set_local_axes(true);
+        c.begin_transform(Drag::Scale { axis: 0, free: 1.0 });
+        c.apply_transform(Drag::Scale { axis: 0, free: 2.0 });
+        c.drag_end();
+        // Along the object's own X the box is now 4 long; across it still 2.
+        let b = c.scene.objects[0].basis;
+        let along: Vec<f32> = c.mesh().verts.iter().map(|v| v.dot(b[0])).collect();
+        let across: Vec<f32> = c.mesh().verts.iter().map(|v| v.dot(b[1])).collect();
+        let span = |v: &[f32]| v.iter().cloned().fold(f32::MIN, f32::max) - v.iter().cloned().fold(f32::MAX, f32::min);
+        assert!((span(&along) - 4.0).abs() < 1e-3 && (span(&across) - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn saved_views_restore_the_camera_survive_undo_and_saving() {
+        let mut c = object_core();
+        c.camera.yaw = 0.3;
+        c.camera.ortho = true;
+        let i = c.view_save("正面から", 1.0, false);
+        c.camera.yaw = -2.0;
+        c.camera.ortho = false;
+        assert_eq!(c.view_apply(i), Some(1.0));
+        assert_eq!((c.camera.yaw, c.camera.ortho), (0.3, true));
+        assert_eq!(c.view_apply(9), None);
+        // "The last shot" is replaced, not piled up.
+        c.view_save("前回の撮影", 0.8, true);
+        c.camera.yaw = 1.0;
+        c.view_save("前回の撮影", 0.8, true);
+        assert_eq!(c.scene.views.len(), 2);
+        assert!(c.views_json().contains("\"name\":\"前回の撮影\""));
+        // Undoing an edit keeps the views.
+        c.add_object(0);
+        assert!(c.undo());
+        assert_eq!(c.scene.views.len(), 2);
+        assert!(c.view_rename(0, "  正面  ") && !c.view_rename(0, "   "));
+        let mut d = Core::new();
+        assert!(d.load(&c.to_bytes()));
+        assert_eq!(d.scene.views, c.scene.views);
+        assert!(d.view_delete(0) && !d.view_delete(5));
+        assert_eq!(d.scene.views.len(), 1);
     }
 
     #[test]
