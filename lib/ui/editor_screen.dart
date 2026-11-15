@@ -11,6 +11,7 @@ import 'gallery_screen.dart';
 import 'modifier_sheet.dart';
 import 'presets.dart';
 import 'view_gizmo.dart';
+import 'views_sheet.dart';
 import 'viewport.dart';
 
 const _panel = Color(0xFF2A2A2E);
@@ -23,6 +24,7 @@ const _bitHasActive = 128;
 const _bitOrtho = 256;
 const _bitMany = 2048;
 const _bitGrouped = 4096;
+const _bitLocal = 8192;
 
 class EditorScreen extends StatefulWidget {
   const EditorScreen({super.key, this.saveCapture, this.saveExport});
@@ -489,6 +491,49 @@ class _EditorScreenState extends State<EditorScreen> with WidgetsBindingObserver
                           ),
                         ),
                       ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  right: 34,
+                  top: top + 58 + 116 + 52,
+                  child: Tooltip(
+                    message: status & _bitLocal != 0 ? '座標軸：ローカル（オブジェクトの向き）' : '座標軸：ワールド',
+                    child: SizedBox(
+                      width: 56,
+                      height: 44,
+                      child: Material(
+                        color: status & _bitLocal != 0 ? accent.withValues(alpha: 0.22) : _panel,
+                        borderRadius: BorderRadius.circular(14),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () => _viewport.setLocalAxes(status & _bitLocal == 0),
+                          child: Center(
+                            child: Text(status & _bitLocal != 0 ? 'ローカル' : 'ワールド',
+                                style: TextStyle(fontSize: 11, color: status & _bitLocal != 0 ? accent : const Color(0xFFD4D4D9))),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  right: 40,
+                  top: top + 58 + 116 + 104,
+                  child: SizedBox(
+                    width: 44,
+                    height: 44,
+                    child: IconButton(
+                      tooltip: '視点',
+                      style: IconButton.styleFrom(backgroundColor: _panel, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
+                      onPressed: () => showModalBottomSheet<void>(
+                        context: context,
+                        isScrollControlled: true,
+                        backgroundColor: const Color(0xFF252528),
+                        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+                        builder: (_) => ViewsSheet(viewport: _viewport),
+                      ),
+                      icon: const Icon(Icons.videocam_outlined, size: 20, color: Color(0xFFD4D4D9)),
                     ),
                   ),
                 ),

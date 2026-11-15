@@ -30,6 +30,9 @@ typedef _Preset = int Function(Pointer<Void>, int, double, double, double, doubl
 typedef _Export2 = Pointer<Uint8> Function(Pointer<Void>, int, int, Pointer<Uint32>);
 typedef _ModSet = int Function(Pointer<Void>, int, int, double);
 typedef _ModFinish = int Function(Pointer<Void>, int, int);
+typedef _ViewSave = int Function(Pointer<Void>, Pointer<Uint8>, int, double, int);
+typedef _ViewApply = double Function(Pointer<Void>, int);
+typedef _ViewRename = int Function(Pointer<Void>, int, Pointer<Uint8>, int);
 typedef _FrameAll = void Function(Pointer<Void>, double, double, double, double, double);
 typedef _Export = int Function(Pointer<Void>, int, int, double, double, double, double, double, double, int, Pointer<Uint8>);
 
@@ -56,6 +59,16 @@ class ModifierInfo {
   final int count;
   final double spacing;
   final int axis;
+}
+
+/// A camera position saved in the work.
+class SavedViewInfo {
+  const SavedViewInfo(this.name, this.ortho, this.aspect);
+  final String name;
+  final bool ortho;
+
+  /// Capture frame width / height when saved; 0 if saved while editing.
+  final double aspect;
 }
 
 /// One entry of the scene list.
@@ -139,6 +152,12 @@ class NativeCore {
     _modifierAdd = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_modifier_add');
     _modifierSet = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32, Float), _ModSet>('imonder_modifier_set');
     _modifierFinish = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Int32), _ModFinish>('imonder_modifier_finish');
+    _setLocalAxes = l.lookupFunction<Void Function(Pointer<Void>, Int32), _Flag>('imonder_set_local_axes');
+    _viewsJson = l.lookupFunction<Pointer<Uint8> Function(Pointer<Void>, Pointer<Uint32>), _Bytes>('imonder_views_json');
+    _viewSave = l.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint8>, Uint32, Float, Int32), _ViewSave>('imonder_view_save');
+    _viewApply = l.lookupFunction<Float Function(Pointer<Void>, Int32), _ViewApply>('imonder_view_apply');
+    _viewDelete = l.lookupFunction<Int32 Function(Pointer<Void>, Int32), _Op>('imonder_view_delete');
+    _viewRename = l.lookupFunction<Int32 Function(Pointer<Void>, Int32, Pointer<Uint8>, Uint32), _ViewRename>('imonder_view_rename');
     _render = l.lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Uint32, Float, Pointer<Uint8>),
         _Render>('imonder_render');
@@ -196,6 +215,12 @@ class NativeCore {
   late final _Op _modifierAdd;
   late final _ModSet _modifierSet;
   late final _ModFinish _modifierFinish;
+  late final _Flag _setLocalAxes;
+  late final _Bytes _viewsJson;
+  late final _ViewSave _viewSave;
+  late final _ViewApply _viewApply;
+  late final _Op _viewDelete;
+  late final _ViewRename _viewRename;
   late final _Render _render;
 
   Pointer<Uint8>? _buf;
@@ -320,6 +345,47 @@ class NativeCore {
     } finally {
       malloc.free(len);
     }
+  }
+
+  /// Transform along the active object's own axes (true) or the world's.
+  void setLocalAxes(bool on) => _setLocalAxes(_handle, on ? 1 : 0);
+
+  // -------------------------------------------------------------------- views --
+
+  List<SavedViewInfo> views() {
+    final len = malloc<Uint32>();
+    try {
+      final list = jsonDecode(utf8.decode(_takeBytes(_viewsJson(_handle, len), len))) as List<dynamic>;
+      return [
+        for (final v in list) SavedViewInfo(v['name'] as String, v['ortho'] as bool, (v['aspect'] as num).toDouble()),
+      ];
+    } finally {
+      malloc.free(len);
+    }
+  }
+
+  /// Saves the camera as [name]; with [replace] an existing view of that name is overwritten.
+  int viewSave(String name, {double aspect = 0, bool replace = false}) {
+    final bytes = Uint8List.fromList(utf8.encode(name));
+    var i = -1;
+    _withBytes(bytes, (p) {
+      i = _viewSave(_handle, p, bytes.length, aspect, replace ? 1 : 0);
+      return true;
+    });
+    return i;
+  }
+
+  /// Moves the camera to a saved view; the frame aspect it was saved with (0 if none), or null.
+  double? viewApply(int index) {
+    final a = _viewApply(_handle, index);
+    return a < 0 ? null : a;
+  }
+
+  bool viewDelete(int index) => _viewDelete(_handle, index) == 1;
+
+  bool viewRename(int index, String name) {
+    final bytes = Uint8List.fromList(utf8.encode(name));
+    return _withBytes(bytes, (p) => _viewRename(_handle, index, p, bytes.length) == 1);
   }
 
   // ---------------------------------------------------------------- modifiers --

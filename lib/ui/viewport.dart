@@ -128,6 +128,27 @@ class ModelViewportController {
 
   void setSnap(bool on) => _run((c) => c.setSnap(on));
 
+  void setLocalAxes(bool on) => _run((c) => c.setLocalAxes(on));
+
+  List<SavedViewInfo> views() => _state?._core.views() ?? const [];
+
+  int viewSave(String name, {double aspect = 0, bool replace = false}) {
+    var i = -1;
+    _run((c) => i = c.viewSave(name, aspect: aspect, replace: replace));
+    return i;
+  }
+
+  /// Jumps to a saved view; returns the capture aspect it was saved with (0 if none).
+  double? viewApply(int index) {
+    double? a;
+    _run((c) => a = c.viewApply(index));
+    _state?._syncAngles();
+    return a;
+  }
+
+  void viewDelete(int index) => _run((c) => c.viewDelete(index));
+  void viewRename(int index, String name) => _run((c) => c.viewRename(index, name));
+
   List<ModifierInfo> modifiers() => _state?._core.modifiers() ?? const [];
 
   int modifierAdd(int kind) {

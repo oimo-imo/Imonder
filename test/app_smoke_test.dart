@@ -311,6 +311,60 @@ void main() {
     await settle(tester, rounds: 30);
   }, skip: skip);
 
+  testWidgets('shoot again from the last shot: the same picture, byte for byte', (tester) async {
+    tester.view.physicalSize = const Size(780, 1688);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+    final saved = <Uint8List>[];
+    await tester.pumpWidget(MaterialApp(
+      home: EditorScreen(saveCapture: (png, name) async => saved.add(png)),
+    ));
+    await settle(tester);
+    await tester.tap(find.byTooltip('撮影'));
+    await settle(tester, rounds: 20);
+    await tester.tap(find.text('箱庭'));
+    await settle(tester, rounds: 10);
+    await tester.tap(find.text('4:5'));
+    await settle(tester, rounds: 10);
+    await tester.tap(find.text('保存 2K'));
+    await settle(tester, rounds: 200);
+    expect(saved, hasLength(1));
+
+    // Wander off: another preset and another frame shape.
+    final presetRow = find.descendant(of: find.byKey(const Key('capture-presets')), matching: find.byType(Scrollable)).first;
+    await tester.scrollUntilVisible(find.text('真上'), 80, scrollable: presetRow);
+    await tester.pumpAndSettle(); // let the fling stop, or the tap only stops the scroll
+    await tester.tap(find.text('真上'));
+    await tester.tap(find.text('16:9'));
+    await settle(tester, rounds: 10);
+    // Back to where the first picture was taken.
+    await tester.scrollUntilVisible(find.text('前回の撮影'), -80, scrollable: presetRow);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('前回の撮影'));
+    await settle(tester, rounds: 10);
+    expect(tester.widget<ChoiceChip>(find.widgetWithText(ChoiceChip, '4:5')).selected, isTrue, reason: 'frame shape restored');
+    await tester.tap(find.text('保存 2K'));
+    await settle(tester, rounds: 200);
+    expect(saved, hasLength(2));
+    expect(saved[1], saved[0], reason: 'same position and frame give the same image');
+
+    // The editor's view list shows it too, and the axes toggle switches.
+    await tester.tap(find.byTooltip('撮影をやめる'));
+    await settle(tester, rounds: 10);
+    await tester.tap(find.byTooltip('視点'));
+    await tester.pumpAndSettle();
+    expect(find.text('前回の撮影'), findsOneWidget);
+    await tester.tapAt(const Offset(10, 10));
+    await tester.pumpAndSettle();
+    expect(find.text('ワールド'), findsOneWidget);
+    await tester.tap(find.text('ワールド'));
+    await tester.pump();
+    expect(find.text('ローカル'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+    await settle(tester, rounds: 30);
+  }, skip: skip);
+
   testWidgets('the gallery lists works and reports what was chosen', (tester) async {
     final store = WorkStore(Directory('${docs.path}/w')..createSync());
     final a = await tester.runAsync(() => store.create(name: 'ねこ'));

@@ -1,7 +1,7 @@
 //! Snapping for transform drags: contact with other objects' surfaces along the drag axis,
 //! otherwise the grid. All functions are pure so they are easy to test.
 
-use crate::math::{v3, V3};
+use crate::math::V3;
 use crate::mesh::Mesh;
 
 /// Rotation snaps to multiples of this (15°).
@@ -14,21 +14,6 @@ pub fn grid_step(view_distance: f32) -> f32 {
     10f32.powf((view_distance * 0.05).max(1e-4).log10().floor())
 }
 
-fn comp(p: V3, axis: usize) -> f32 {
-    match axis {
-        0 => p.x,
-        1 => p.y,
-        _ => p.z,
-    }
-}
-
-fn axis_vec(axis: usize) -> V3 {
-    match axis {
-        0 => v3(1.0, 0.0, 0.0),
-        1 => v3(0.0, 1.0, 0.0),
-        _ => v3(0.0, 0.0, 1.0),
-    }
-}
 
 /// Signed distance along `dir` from `o` to triangle (a, b, c), if the line through `o` hits it.
 fn ray_triangle(o: V3, dir: V3, a: V3, b: V3, c: V3) -> Option<f32> {
@@ -56,12 +41,12 @@ fn triangles(faces: &[Vec<V3>]) -> impl Iterator<Item = (V3, V3, V3)> + '_ {
     faces.iter().flat_map(|f| (1..f.len().saturating_sub(1)).map(move |k| (f[0], f[k], f[k + 1])))
 }
 
-/// Bounds of points on the two axes other than `axis`.
-fn footprint(pts: impl Iterator<Item = V3>, axis: usize) -> Option<[f32; 4]> {
-    let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+/// Bounds of points across the drag direction (in the plane perpendicular to `dir`).
+fn footprint(pts: impl Iterator<Item = V3>, dir: V3) -> Option<[f32; 4]> {
+    let (a, b) = crate::edit::ring_basis(dir);
     let mut r: Option<[f32; 4]> = None;
     for p in pts {
-        let (x, y) = (comp(p, a), comp(p, b));
+        let (x, y) = (p.dot(a), p.dot(b));
         r = Some(match r {
             None => [x, y, x, y],
             Some([x0, y0, x1, y1]) => [x0.min(x), y0.min(y), x1.max(x), y1.max(y)],
@@ -74,21 +59,20 @@ fn overlaps(a: [f32; 4], b: [f32; 4], slack: f32) -> bool {
     a[0] <= b[2] + slack && b[0] <= a[2] + slack && a[1] <= b[3] + slack && b[1] <= a[3] + slack
 }
 
-/// The translation along `axis` to use when the user dragged `free` from the start.
+/// The translation along `dir` (a unit vector) to use when the user dragged `free` from the start.
 ///
 /// `moved` are the moving vertices and `moved_faces` the faces that move with them, both at
 /// their starting positions; `others` are the meshes to snap against. Returns `free` adjusted
 /// so the moving geometry touches another surface when that is within `threshold`, or else
 /// lands on the grid (its lowest point, highest point or centre on a grid line).
-pub fn snap_move(moved: &[V3], moved_faces: &[Vec<V3>], others: &[&Mesh], axis: usize, free: f32, threshold: f32, grid: f32) -> f32 {
+pub fn snap_move(moved: &[V3], moved_faces: &[Vec<V3>], others: &[&Mesh], dir: V3, free: f32, threshold: f32, grid: f32) -> f32 {
     if moved.is_empty() {
         return free;
     }
-    let dir = axis_vec(axis);
     let shift = dir.scale(free);
     let now: Vec<V3> = moved.iter().map(|p| p.add(shift)).collect();
     let now_faces: Vec<Vec<V3>> = moved_faces.iter().map(|f| f.iter().map(|p| p.add(shift)).collect()).collect();
-    let mine = footprint(now.iter().copied(), axis);
+    let mine = footprint(now.iter().copied(), dir);
 
     // Contact: the smallest extra move that makes a moving vertex touch another surface, or
     // another object's vertex touch a moving face.
@@ -99,7 +83,7 @@ pub fn snap_move(moved: &[V3], moved_faces: &[Vec<V3>], others: &[&Mesh], axis: 
         }
     };
     for other in others {
-        let Some(theirs) = footprint(other.verts.iter().copied(), axis) else { continue };
+        let Some(theirs) = footprint(other.verts.iter().copied(), dir) else { continue };
         if !mine.map_or(false, |m| overlaps(m, theirs, threshold)) {
             continue;
         }
@@ -128,8 +112,8 @@ pub fn snap_move(moved: &[V3], moved_faces: &[Vec<V3>], others: &[&Mesh], axis: 
     if grid <= 0.0 {
         return free;
     }
-    let lo = now.iter().map(|&p| comp(p, axis)).fold(f32::MAX, f32::min);
-    let hi = now.iter().map(|&p| comp(p, axis)).fold(f32::MIN, f32::max);
+    let lo = now.iter().map(|&p| p.dot(dir)).fold(f32::MAX, f32::min);
+    let hi = now.iter().map(|&p| p.dot(dir)).fold(f32::MIN, f32::max);
     [lo, hi, (lo + hi) * 0.5]
         .iter()
         .map(|&v| (v / grid).round() * grid - v)
@@ -148,6 +132,7 @@ pub fn snap_scale(total: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::v3;
 
     fn box_mesh(lo: (f32, f32, f32), hi: (f32, f32, f32)) -> Mesh {
         let mut m = Mesh::cube(1.0);
@@ -169,10 +154,10 @@ mod tests {
         let cube = box_mesh((-0.5, -0.5, 4.0), (0.5, 0.5, 5.0));
         let (pts, faces) = parts(&cube);
         // Dragged down by 2.9: the cube's bottom (z = 4) would be at 1.1, just above the table.
-        let t = snap_move(&pts, &faces, &[&table], 2, -2.9, 0.3, 0.1);
+        let t = snap_move(&pts, &faces, &[&table], v3(0.0, 0.0, 1.0), -2.9, 0.3, 0.1);
         assert!((t + 3.0).abs() < 1e-4, "bottom lands exactly on the top: {t}");
         // Pushed slightly into the table: pulled back out to touch it.
-        let t = snap_move(&pts, &faces, &[&table], 2, -3.15, 0.3, 0.1);
+        let t = snap_move(&pts, &faces, &[&table], v3(0.0, 0.0, 1.0), -3.15, 0.3, 0.1);
         assert!((t + 3.0).abs() < 1e-4, "{t}");
     }
 
@@ -182,9 +167,9 @@ mod tests {
         let far_wall = box_mesh((2.0, 10.0, 0.0), (2.4, 12.0, 3.0)); // not in the way
         let cube = box_mesh((-0.5, -0.5, 0.0), (0.5, 0.5, 1.0));
         let (pts, faces) = parts(&cube);
-        let t = snap_move(&pts, &faces, &[&wall], 0, 1.37, 0.3, 0.0);
+        let t = snap_move(&pts, &faces, &[&wall], v3(1.0, 0.0, 0.0), 1.37, 0.3, 0.0);
         assert!((t - 1.5).abs() < 1e-4, "right side touches the wall: {t}");
-        let t = snap_move(&pts, &faces, &[&far_wall], 0, 1.37, 0.3, 0.0);
+        let t = snap_move(&pts, &faces, &[&far_wall], v3(1.0, 0.0, 0.0), 1.37, 0.3, 0.0);
         assert!((t - 1.37).abs() < 1e-6, "no contact, no grid: unchanged ({t})");
     }
 
@@ -197,12 +182,12 @@ mod tests {
         }
         let plate = box_mesh((-2.0, -2.0, 3.0), (2.0, 2.0, 3.2));
         let (pts, faces) = parts(&plate);
-        let t = snap_move(&pts, &faces, &[&cone], 2, -1.9, 0.3, 0.0);
+        let t = snap_move(&pts, &faces, &[&cone], v3(0.0, 0.0, 1.0), -1.9, 0.3, 0.0);
         assert!((t + 2.0).abs() < 1e-4, "plate rests on the tip: {t}");
         // A small cube slid sideways into the cone's slanted side.
         let cube = box_mesh((-3.2, -0.1, -0.6), (-3.0, 0.1, -0.4));
         let (pts, faces) = parts(&cube);
-        let t = snap_move(&pts, &faces, &[&cone], 0, 2.25, 0.3, 0.0);
+        let t = snap_move(&pts, &faces, &[&cone], v3(1.0, 0.0, 0.0), 2.25, 0.3, 0.0);
         let right = -3.0 + t;
         // The cone widens downwards: radius 0.8 at the cube's lower edge (z = -0.6), so that
         // corner meets the side first, at x = 0.1 - 0.8 = -0.7 (a 16-gon sits a little inside).
@@ -213,11 +198,24 @@ mod tests {
     fn grid_when_nothing_is_near() {
         let cube = box_mesh((-0.5, -0.5, 0.0), (0.5, 0.5, 1.0));
         let (pts, faces) = parts(&cube);
-        let t = snap_move(&pts, &faces, &[], 0, 0.437, 0.3, 0.25);
+        let t = snap_move(&pts, &faces, &[], v3(1.0, 0.0, 0.0), 0.437, 0.3, 0.25);
         // Edges at -0.063 / 0.937, centre 0.437: the closest grid line is 0 for the left side.
         assert!((t - 0.5).abs() < 1e-5, "{t}");
         assert_eq!(grid_step(7.0), 0.1);
         assert_eq!(grid_step(40.0), 1.0);
+    }
+
+    #[test]
+    fn works_along_a_tilted_direction() {
+        // A table top, and a cube above it moved along a 45° direction in the XZ plane.
+        let table = box_mesh((-3.0, -3.0, 0.0), (3.0, 3.0, 1.0));
+        let cube = box_mesh((-0.5, -0.5, 3.0), (0.5, 0.5, 4.0));
+        let (pts, faces) = parts(&cube);
+        let dir = v3(1.0, 0.0, -1.0).norm();
+        // Free move of 2.6 brings the bottom to 4-... the cube must stop when its bottom (z 3)
+        // reaches z 1: that is a move of 2 * sqrt(2) along dir.
+        let t = snap_move(&pts, &faces, &[&table], dir, 2.7, 0.3, 0.0);
+        assert!((t - 2.0 * 2.0f32.sqrt()).abs() < 1e-3, "{t}");
     }
 
     #[test]

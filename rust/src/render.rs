@@ -255,8 +255,8 @@ pub struct Scene<'a> {
     pub active: usize,
     /// Edit mode: selection highlight and vertex dots on the active object.
     pub edit: Option<EditOverlay<'a>>,
-    /// Transform handles: centre, world length and style, if they should be drawn.
-    pub handles: Option<(V3, f32, HandleStyle)>,
+    /// Transform handles: centre, world length, style and the axes they follow.
+    pub handles: Option<(V3, f32, HandleStyle, crate::edit::Axes)>,
     /// Outline the selected objects (object mode).
     pub highlight: bool,
 }
@@ -374,14 +374,14 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
     if let (Some(e), Some(obj)) = (&scene.edit, scene.objects.get(scene.active)) {
         draw_edit_overlay(&mut f, &obj.mesh, e, &vp, eye, scale, line_bias * 2.0);
     }
-    if let Some((centre, len, style)) = scene.handles {
+    if let Some((centre, len, style, axes)) = scene.handles {
         let c0 = clip(&vp, centre);
         match style {
             HandleStyle::Rotate => {
                 for (axis, col) in AXIS_COL.iter().enumerate() {
-                    let mut prev = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, 0));
+                    let mut prev = clip(&vp, crate::edit::ring_point(centre, axes[axis], len * 0.9, 0));
                     for i in 1..=crate::edit::RING_SEGMENTS {
-                        let cur = clip(&vp, crate::edit::ring_point(centre, axis, len * 0.9, i));
+                        let cur = clip(&vp, crate::edit::ring_point(centre, axes[axis], len * 0.9, i));
                         f.line(prev, cur, *col, 0.9, 2.6 * scale, 4.0);
                         prev = cur;
                     }
@@ -389,7 +389,7 @@ pub fn render_scene(scene: &Scene, cam: &Camera, w: usize, h: usize, scale: f32,
             }
             HandleStyle::Move | HandleStyle::Scale => {
                 for (axis, col) in AXIS_COL.iter().enumerate() {
-                    let tip = clip(&vp, centre.add(crate::edit::axis_vec(axis).scale(len)));
+                    let tip = clip(&vp, centre.add(axes[axis].scale(len)));
                     f.line(c0, tip, *col, 0.95, 3.0 * scale, 4.0);
                     // The axis direction on screen; an axis pointing at the camera has none.
                     let head = (c0.0[3] > 0.05 && tip.0[3] > 0.05).then(|| {
